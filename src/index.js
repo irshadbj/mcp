@@ -16,7 +16,14 @@ const LOGO_SVG =
   '</svg>';
 
 const SERVER_DESCRIPTION =
-  "Irshad's private notes server. Create, search, read, update and delete notes with tags, stored in Supabase.";
+  "Irshad's private notes server. Create, search, read, update and delete notes with tags, and publish public HTML pages, all stored in Supabase.";
+
+// Published pages are untrusted markup served from this origin, so scripts,
+// same-origin requests and framing are all denied.
+const PAGE_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; img-src data: blob: https:; " +
+  "font-src data: https:; media-src data: https:; base-uri 'none'; " +
+  "form-action 'none'; frame-ancestors 'none'";
 
 const app = new Hono();
 app.all("*", (c) => handle(c.req.raw, process.env));
@@ -51,6 +58,45 @@ async function handle(request, env) {
 
   if (url.pathname === "/" && request.method === "GET") {
     return new Response(homeHtml(), { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
+  }
+
+  // Public pages published through the MCP publish_page tool.
+  if (request.method === "GET" && url.pathname.startsWith("/p/")) {
+    const pageHeaders = {
+      "Content-Type": "text/html; charset=utf-8",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": PAGE_CSP
+    };
+
+    let slug = "";
+    try {
+      slug = decodeURIComponent(url.pathname.slice(3)).trim().toLowerCase();
+    } catch {}
+
+    if (!isValidSlug(slug)) return pageNotFound(pageHeaders);
+
+    if (!dbReady(env)) {
+      return Response.json(
+        { error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY." },
+        { status: 500, headers: corsHeaders() }
+      );
+    }
+
+    let row = null;
+    try {
+      row = await getPage(env, slug);
+    } catch {
+      return Response.json(
+        { error: "Database request failed." },
+        { status: 500, headers: corsHeaders() }
+      );
+    }
+
+    if (!row) return pageNotFound(pageHeaders);
+
+    return new Response(row.html, {
+      headers: { ...pageHeaders, "Cache-Control": "public, max-age=60" }
+    });
   }
 
   // Protect the dashboard and its API independently from MCP authentication.
@@ -180,11 +226,12 @@ async function handle(request, env) {
         },
         {
           name: "list_notes",
-          description: "List notes or search title, content and tags.",
+          description: "List notes or search title, content and tags, optionally filtered by tag.",
           inputSchema: {
             type: "object",
             properties: {
               query: { type: "string" },
+              tag: { type: "string", maxLength: 40 },
               limit: { type: "integer", minimum: 1, maximum: 100 }
             }
           }
@@ -219,6 +266,53 @@ async function handle(request, env) {
             type: "object",
             properties: { id: { type: "string" } },
             required: ["id"]
+          }
+        },
+        {
+          name: "publish_page",
+          description:
+            "Publish (create or replace) a public HTML page served at /p/<slug> on this server.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              slug: {
+                type: "string",
+                pattern: "^[a-z0-9][a-z0-9-]{0,63}$",
+                description: "Optional URL slug; derived from the title when omitted."
+              },
+              title: { type: "string", minLength: 1, maxLength: 200 },
+              html: { type: "string", minLength: 1, maxLength: 200000 }
+            },
+            required: ["title", "html"]
+          }
+        },
+        {
+          name: "list_pages",
+          description: "List published pages or search their title and slug.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: { type: "string" },
+              limit: { type: "integer", minimum: 1, maximum: 100 }
+            }
+          }
+        },
+        {
+          name: "get_page",
+          description: "Read a published page by slug, including its HTML.",
+          inputSchema: {
+            type: "object",
+            properties: { slug: { type: "string" } },
+            required: ["slug"]
+          }
+        },
+        {
+          name: "delete_page",
+          description: "Permanently unpublish a page by slug.",
+          inputSchema: {
+            type: "object",
+            properties: { slug: { type: "string" } },
+            required: ["slug"]
           }
         }
       ]
@@ -260,6 +354,7 @@ async function handle(request, env) {
         id: noteId,
         title,
         content,
+        html: renderNoteHtml(content),
         tags,
         created_at: now,
         updated_at: now
@@ -275,7 +370,11 @@ async function handle(request, env) {
         ? args.query.trim().slice(0, 200)
         : "";
 
-      output = (await listNotes(env, { query, limit })).map(parseNote);
+      const tag = typeof args.tag === "string"
+        ? args.tag.trim().slice(0, 40)
+        : "";
+
+      output = (await listNotes(env, { query, tag, limit })).map(parseNote);
 
     } else if (tool === "get_note") {
       const noteId = cleanString(args.id, 100);
@@ -325,6 +424,68 @@ async function handle(request, env) {
 
       output = { deleted: true, id: noteId };
 
+    } else if (tool === "publish_page") {
+      const title = cleanString(args.title, 200);
+      const html = cleanString(args.html, 200000, false);
+
+      if (!title || !html) {
+        throw new Error("title and html are required.");
+      }
+
+      const requested =
+        typeof args.slug === "string" ? args.slug.trim().toLowerCase() : "";
+      const slug = requested || toSlug(title);
+
+      if (!isValidSlug(slug)) {
+        throw new Error(
+          "Invalid slug. Use 1-64 characters: a-z, 0-9 and hyphens."
+        );
+      }
+
+      const existing = await getPage(env, slug);
+      const now = new Date().toISOString();
+
+      const saved = await savePage(env, slug, {
+        slug,
+        title,
+        html,
+        created_at: (existing && existing.created_at) || now,
+        updated_at: now
+      });
+
+      output = pageView(saved, url.origin);
+
+    } else if (tool === "list_pages") {
+      const limit = Math.max(
+        1,
+        Math.min(100, Number.parseInt(args.limit, 10) || 25)
+      );
+      const query = typeof args.query === "string"
+        ? args.query.trim().slice(0, 200)
+        : "";
+
+      output = (await listPages(env, { query, limit })).map(p =>
+        pageView(p, url.origin)
+      );
+
+    } else if (tool === "get_page") {
+      const slug =
+        typeof args.slug === "string" ? args.slug.trim().toLowerCase() : "";
+      if (!isValidSlug(slug)) throw new Error("Invalid slug.");
+
+      const row = await getPage(env, slug);
+      if (!row) throw new Error("Page not found.");
+
+      output = pageView(row, url.origin);
+
+    } else if (tool === "delete_page") {
+      const slug =
+        typeof args.slug === "string" ? args.slug.trim().toLowerCase() : "";
+      if (!isValidSlug(slug)) throw new Error("Invalid slug.");
+
+      if (!(await deletePage(env, slug))) throw new Error("Page not found.");
+      output = { deleted: true, slug, url: url.origin + "/p/" + slug };
+
     } else {
       return rpcError(id, -32602, `Unknown tool: ${tool}`);
     }
@@ -361,9 +522,9 @@ function qs(pairs) {
   );
 }
 
-async function sb(env, query, init = {}) {
+async function sb(env, table, query = "", init = {}) {
   const endpoint =
-    String(env.SUPABASE_URL).replace(/\/+$/, "") + "/rest/v1/notes";
+    String(env.SUPABASE_URL).replace(/\/+$/, "") + "/rest/v1/" + table;
   const key = env.SUPABASE_SERVICE_ROLE_KEY;
 
   const res = await fetch(endpoint + (query || ""), {
@@ -406,21 +567,24 @@ async function listNotes(env, { query = "", tag = "", limit = 25 }) {
     ]);
   }
 
-  if (tag) pairs.push(["tags", "ilike.*" + tag + "*"]);
+  if (tag) {
+    pairs.push(["tags", "ilike.*" + cleanFilter(tag) + "*"]);
+  }
 
-  return (await sb(env, qs(pairs))) || [];
+  return (await sb(env, "notes", qs(pairs))) || [];
 }
 
 async function getNote(env, id) {
   const rows = await sb(
     env,
+    "notes",
     qs([["select", "*"], ["id", "eq." + id], ["limit", "1"]])
   );
   return rows && rows[0] ? rows[0] : null;
 }
 
 async function insertNote(env, row) {
-  const rows = await sb(env, "", {
+  const rows = await sb(env, "notes", "", {
     method: "POST",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify(row)
@@ -429,7 +593,7 @@ async function insertNote(env, row) {
 }
 
 async function updateNote(env, id, patch) {
-  const rows = await sb(env, qs([["id", "eq." + id]]), {
+  const rows = await sb(env, "notes", qs([["id", "eq." + id]]), {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify(patch)
@@ -438,7 +602,48 @@ async function updateNote(env, id, patch) {
 }
 
 async function deleteNote(env, id) {
-  const rows = await sb(env, qs([["id", "eq." + id]]), {
+  const rows = await sb(env, "notes", qs([["id", "eq." + id]]), {
+    method: "DELETE",
+    headers: { Prefer: "return=representation" }
+  });
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+async function listPages(env, { query = "", limit = 25 }) {
+  const pairs = [
+    ["select", "*"],
+    ["order", "updated_at.desc"],
+    ["limit", String(limit)]
+  ];
+
+  if (query) {
+    const p = '"*' + query.replace(/[\\"]/g, "\\$&") + '*"';
+    pairs.push(["or", `(title.ilike.${p},slug.ilike.${p})`]);
+  }
+
+  return (await sb(env, "pages", qs(pairs))) || [];
+}
+
+async function getPage(env, slug) {
+  const rows = await sb(
+    env,
+    "pages",
+    qs([["select", "*"], ["slug", "eq." + slug], ["limit", "1"]])
+  );
+  return rows && rows[0] ? rows[0] : null;
+}
+
+async function savePage(env, slug, row) {
+  const rows = await sb(env, "pages", qs([["on_conflict", "slug"]]), {
+    method: "POST",
+    headers: { Prefer: "return=representation,resolution=merge-duplicates" },
+    body: JSON.stringify({ ...row, slug })
+  });
+  return rows && rows[0] ? rows[0] : null;
+}
+
+async function deletePage(env, slug) {
+  const rows = await sb(env, "pages", qs([["slug", "eq." + slug]]), {
     method: "DELETE",
     headers: { Prefer: "return=representation" }
   });
@@ -450,7 +655,7 @@ async function deleteNote(env, id) {
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers":
       "Content-Type, Authorization, Accept, Mcp-Session-Id, Last-Event-ID",
     "Access-Control-Expose-Headers": "Mcp-Session-Id",
@@ -478,6 +683,11 @@ function cleanString(value, max, trim = true) {
   return out.length > 0 && out.length <= max ? out : "";
 }
 
+function cleanFilter(value) {
+  // Strips characters that carry meaning in PostgREST filter expressions.
+  return String(value).replace(/[%_,()"]/g, "");
+}
+
 function cleanTags(value) {
   if (!Array.isArray(value)) return [];
 
@@ -497,7 +707,181 @@ function parseTags(value) {
 }
 
 function parseNote(row) {
-  return { ...row, tags: parseTags(row.tags) };
+  const tags = parseTags(row.tags);
+  return { ...row, tags, html: renderNoteHtml(row.content) };
+}
+
+/* ---------- plain text -> safe HTML rendering ---------- */
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])
+  );
+}
+
+function inlineHtml(text) {
+  return String(text)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(
+      /\[([^\]]+)\]\((https?:\/\/[^\s)]+|\/[^\s)]*)\)/g,
+      '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>'
+    );
+}
+
+/**
+ * Turns a note's plain text into semantic HTML: headings, paragraphs, lists,
+ * quotes, horizontal rules, fenced code and inline emphasis/links.
+ * Every line is escaped first, so the output is always safe to inject.
+ */
+function renderNoteHtml(content) {
+  const lines = String(content ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let inCode = false;
+  let list = null;
+  let para = [];
+
+  const flushPara = () => {
+    if (para.length) out.push("<p>" + para.join("<br>") + "</p>");
+    para = [];
+  };
+  const closeList = () => {
+    if (list) {
+      out.push("</" + list + ">");
+      list = null;
+    }
+  };
+
+  for (const rawLine of lines) {
+    const line = escapeHtml(rawLine);
+
+    if (/^\s*```/.test(line)) {
+      flushPara();
+      closeList();
+      if (inCode) {
+        out.push("</code></pre>");
+        inCode = false;
+      } else {
+        out.push("<pre><code>");
+        inCode = true;
+      }
+      continue;
+    }
+
+    if (inCode) {
+      out.push(line + "\n");
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushPara();
+      closeList();
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,3})\s+(.*)$/);
+    if (heading) {
+      flushPara();
+      closeList();
+      const level = heading[1].length;
+      out.push(
+        "<h" + level + ">" + inlineHtml(heading[2]) + "</h" + level + ">"
+      );
+      continue;
+    }
+
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) {
+      flushPara();
+      closeList();
+      out.push("<hr>");
+      continue;
+    }
+
+    const bullet = line.match(/^\s*[-*+]\s+(.*)$/);
+    if (bullet) {
+      flushPara();
+      if (list !== "ul") {
+        closeList();
+        out.push("<ul>");
+        list = "ul";
+      }
+      out.push("<li>" + inlineHtml(bullet[1]) + "</li>");
+      continue;
+    }
+
+    const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (numbered) {
+      flushPara();
+      if (list !== "ol") {
+        closeList();
+        out.push("<ol>");
+        list = "ol";
+      }
+      out.push("<li>" + inlineHtml(numbered[1]) + "</li>");
+      continue;
+    }
+
+    const quote = line.match(/^\s*&gt;\s?(.*)$/);
+    if (quote) {
+      flushPara();
+      closeList();
+      out.push("<blockquote>" + inlineHtml(quote[1]) + "</blockquote>");
+      continue;
+    }
+
+    para.push(inlineHtml(line));
+  }
+
+  if (inCode) out.push("</code></pre>");
+  flushPara();
+  closeList();
+
+  return out.join("");
+}
+
+/* ---------- published pages ---------- */
+
+const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+
+function isValidSlug(value) {
+  return typeof value === "string" && SLUG_PATTERN.test(value);
+}
+
+function toSlug(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64)
+    .replace(/-+$/g, "");
+}
+
+function pageView(row, origin) {
+  return {
+    slug: row.slug,
+    title: row.title,
+    html: row.html,
+    url: origin + "/p/" + row.slug,
+    created_at: row.created_at,
+    updated_at: row.updated_at
+  };
+}
+
+function pageNotFound(headers) {
+  return new Response(
+    '<!doctype html><html lang="en"><meta charset="utf-8">' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+      "<title>Page not found</title>" +
+      '<body style="font:16px/1.6 system-ui,-apple-system,sans-serif;margin:64px auto;max-width:640px;padding:0 20px;color:#172033">' +
+      "<h1>Page not found</h1>" +
+      "<p>This page is not published on this server.</p>" +
+      '<p><a href="/" style="color:#3157d5">Back to the home page</a></p>' +
+      "</body></html>",
+    { status: 404, headers }
+  );
 }
 
 function dashboardAuth(request, env) {
@@ -639,6 +1023,54 @@ async function handleDashboardApi(request, env, url) {
     );
   }
 
+  if (request.method === "GET" && url.pathname === "/api/pages") {
+    const query = (url.searchParams.get("q") || "").trim().slice(0, 200);
+
+    const limit = Math.max(
+      1,
+      Math.min(
+        100,
+        Number.parseInt(url.searchParams.get("limit") || "100", 10) || 100
+      )
+    );
+
+    const rows = await listPages(env, { query, limit });
+    return Response.json(
+      rows.map(p => pageView(p, url.origin)),
+      { headers }
+    );
+  }
+
+  const pageMatch = url.pathname.match(/^\/api\/pages\/([^/]+)$/);
+
+  if (pageMatch) {
+    let slug;
+
+    try {
+      slug = decodeURIComponent(pageMatch[1]).trim().toLowerCase();
+    } catch {
+      return Response.json({ error: "Invalid slug" }, { status: 400, headers });
+    }
+
+    if (!isValidSlug(slug)) {
+      return Response.json({ error: "Invalid slug" }, { status: 400, headers });
+    }
+
+    if (request.method === "GET") {
+      const row = await getPage(env, slug);
+
+      return row
+        ? Response.json(pageView(row, url.origin), { headers })
+        : Response.json({ error: "Page not found" }, { status: 404, headers });
+    }
+
+    if (request.method === "DELETE") {
+      return (await deletePage(env, slug))
+        ? Response.json({ deleted: true, slug }, { headers })
+        : Response.json({ error: "Page not found" }, { status: 404, headers });
+    }
+  }
+
   const match = url.pathname.match(/^\/api\/notes\/([^/]+)$/);
 
   if (match) {
@@ -764,15 +1196,16 @@ footer{border-top:1px solid var(--line);margin-top:24px;padding:24px 0;color:var
 </style></head><body>
 <header><div class="wrap nav"><a class="brand" href="/"><img src="/logo.svg" alt="IrshadMCP logo"><span>IrshadMCP</span></a><nav class="navlinks"><a href="/">Home</a><a href="#connection">Connection</a><a href="#capabilities">Capabilities</a><a href="/admin">Notes dashboard</a></nav></div></header>
 <main class="wrap"><section class="hero"><div class="eyebrow">MCP server profile</div><h1>Meet IrshadMCP.</h1><p class="lead">A personal notes server that lets compatible AI assistants securely work with your notes through the Model Context Protocol (MCP).</p>
-<div class="profile"><article class="panel"><div class="identity"><img src="/logo.svg" alt="IrshadMCP logo"><div><h2>IrshadMCP</h2><div class="muted">Personal notes · Remote MCP server</div><span class="pill">HTTP endpoint · JSON-RPC</span></div></div><p class="muted">Create, search, read, update and delete notes with tags. Notes are persisted in Supabase; the web dashboard is protected separately from MCP access.</p><div class="actions"><a class="btn" href="#connection">Get connection details</a><a class="btn alt" href="/logo.svg" target="_blank" rel="noopener">View logo SVG ↗</a></div></article>
+<div class="profile"><article class="panel"><div class="identity"><img src="/logo.svg" alt="IrshadMCP logo"><div><h2>IrshadMCP</h2><div class="muted">Personal notes · Remote MCP server</div><span class="pill">HTTP endpoint · JSON-RPC</span></div></div><p class="muted">Create, search, read, update and delete notes with tags, and publish public HTML pages. Everything is persisted in Supabase; the web dashboard is protected separately from MCP access.</p><div class="actions"><a class="btn" href="#connection">Get connection details</a><a class="btn alt" href="/logo.svg" target="_blank" rel="noopener">View logo SVG ↗</a></div></article>
 <aside class="panel"><h3>Server at a glance</h3><table><tr><td>Name</td><td>IrshadMCP</td></tr><tr><td>Protocol</td><td>Model Context Protocol</td></tr><tr><td>Transport</td><td>Remote HTTP · JSON-RPC</td></tr><tr><td>Storage</td><td>Supabase PostgreSQL</td></tr><tr><td>Version</td><td>1.1.0</td></tr><tr><td>Authentication</td><td>Bearer key if configured; dashboard uses separate credentials</td></tr></table></aside></div></section>
 <section class="section" id="connection"><article class="panel"><h2>Connection details</h2><p class="muted">Use this endpoint in an MCP-compatible client. Authentication must match the server configuration.</p><div class="endpoint"><code id="endpoint">${endpoint}</code><button id="copy" type="button">Copy endpoint</button></div><div class="actions"><a class="btn alt" href="/logo.svg" target="_blank" rel="noopener">Logo URL</a><a class="btn alt" href="https://modelcontextprotocol.io/" target="_blank" rel="noopener noreferrer">MCP website ↗</a><a class="btn alt" href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt" target="_blank" rel="noopener noreferrer">ChatGPT connection guide ↗</a></div><p class="muted" style="margin-bottom:0">Public information page only. It does not display secrets, note contents, or authentication keys.</p></article></section>
 <section class="section" id="capabilities"><h2>Available tools</h2><p class="muted">These tools are exposed to connected clients for note management.</p><div class="grid">
 <article class="card"><div class="symbol">＋</div><h3>Create notes</h3><p class="muted">Save a note with a title, content and optional tags.</p><span class="tool">create_note</span></article>
 <article class="card"><div class="symbol">⌕</div><h3>Search and read</h3><p class="muted">Find notes by title, content or tags, then retrieve a note by ID.</p><span class="tool">list_notes</span><span class="tool">get_note</span></article>
 <article class="card"><div class="symbol">↻</div><h3>Maintain notes</h3><p class="muted">Edit titles, content and tags, or permanently delete a note when requested.</p><span class="tool">update_note</span><span class="tool">delete_note</span></article>
+<article class="card"><div class="symbol">◧</div><h3>Publish pages</h3><p class="muted">Publish, read and remove public HTML pages served from this server at <code>/p/your-slug</code>.</p><span class="tool">publish_page</span><span class="tool">list_pages</span><span class="tool">get_page</span><span class="tool">delete_page</span></article>
 </div></section>
-<section class="section"><article class="panel"><h2>Useful links</h2><table><tr><td>Home page</td><td><a href="/">IrshadMCP landing page ↗</a></td></tr><tr><td>MCP endpoint</td><td><a href="/mcp">/mcp</a> <span class="muted">(POST requests; a browser GET is not a health check)</span></td></tr><tr><td>Logo</td><td><a href="/logo.svg">/logo.svg</a></td></tr><tr><td>Notes dashboard</td><td><a href="/admin">/admin</a> <span class="muted">(requires dashboard login)</span></td></tr><tr><td>MCP specification</td><td><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener noreferrer">modelcontextprotocol.io ↗</a></td></tr><tr><td>ChatGPT setup</td><td><a href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt" target="_blank" rel="noopener noreferrer">Official connection guide ↗</a></td></tr></table></article></section></main>
+<section class="section"><article class="panel"><h2>Useful links</h2><table><tr><td>Home page</td><td><a href="/">IrshadMCP landing page ↗</a></td></tr><tr><td>MCP endpoint</td><td><a href="/mcp">/mcp</a> <span class="muted">(POST requests; a browser GET is not a health check)</span></td></tr><tr><td>Logo</td><td><a href="/logo.svg">/logo.svg</a></td></tr><tr><td>Published pages</td><td><code>/p/&lt;slug&gt;</code> <span class="muted">(HTML published through the publish_page tool)</span></td></tr><tr><td>Notes dashboard</td><td><a href="/admin">/admin</a> <span class="muted">(requires dashboard login)</span></td></tr><tr><td>MCP specification</td><td><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener noreferrer">modelcontextprotocol.io ↗</a></td></tr><tr><td>ChatGPT setup</td><td><a href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt" target="_blank" rel="noopener noreferrer">Official connection guide ↗</a></td></tr></table></article></section></main>
 <footer><div class="wrap foot"><span>IrshadMCP · Personal notes for AI workflows</span><a href="/">Back to home ↑</a></div></footer>
 <script>document.getElementById("copy").addEventListener("click",async()=>{const b=document.getElementById("copy");try{await navigator.clipboard.writeText(document.getElementById("endpoint").textContent);b.textContent="Copied!";}catch{b.textContent="Copy unavailable — select the URL";}setTimeout(()=>b.textContent="Copy endpoint",2000);});</script></body></html>`;
 }
