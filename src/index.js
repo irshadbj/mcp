@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { homeHtml } from "./pages/home.js";
 import { dashboardHtml } from "./pages/admin.js";
+import { pagesIndexHtml } from "./pages/pages.js";
 
 const LOGO_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">' +
@@ -58,6 +59,31 @@ async function handle(request, env) {
 
   if (url.pathname === "/" && request.method === "GET") {
     return new Response(homeHtml(), { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" } });
+  }
+
+  // Public directory of pages published through the MCP publish_page tool.
+  // Only titles, slugs and timestamps are listed; page HTML stays on /p/<slug>.
+  if ((url.pathname === "/pages" || url.pathname === "/pages/") && request.method === "GET") {
+    const headers = {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=60",
+      "X-Content-Type-Options": "nosniff"
+    };
+
+    let rows = [];
+    let error = "";
+
+    if (!dbReady(env)) {
+      error = "Published pages are unavailable because the database is not configured.";
+    } else {
+      try {
+        rows = await listPages(env, { query: "", limit: 100 });
+      } catch {
+        error = "Published pages could not be loaded right now. Please try again shortly.";
+      }
+    }
+
+    return new Response(pagesIndexHtml(rows, { error }), { headers });
   }
 
   // Public pages published through the MCP publish_page tool.

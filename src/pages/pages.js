@@ -1,0 +1,72 @@
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
+  );
+}
+
+function formatDate(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "" : date.toLocaleString();
+}
+
+/**
+ * Public directory of pages published through the MCP publish_page tool.
+ * Only titles, slugs and timestamps are rendered — never the page HTML itself.
+ */
+export function pagesIndexHtml(pages, { error = "" } = {}) {
+  const items = (Array.isArray(pages) ? pages : [])
+    .map(
+      p => `<article class="card"><h3><a href="/p/${encodeURIComponent(p.slug)}">${esc(p.title)}</a></h3>` +
+        `<div class="meta">/p/${esc(p.slug)} · Updated ${esc(formatDate(p.updated_at))}</div></article>`
+    )
+    .join("");
+
+  const body = error
+    ? `<p class="empty">${esc(error)}</p>`
+    : items ||
+      '<p class="empty">No pages published yet. Pages appear here as soon as they are published through the <code>publish_page</code> tool.</p>';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="Directory of public pages published on IrshadMCP.">
+<link rel="icon" type="image/svg+xml" href="/logo.svg">
+<title>IrshadMCP · Published pages</title>
+<style>
+:root{color-scheme:light;--ink:#172033;--muted:#66738a;--line:#e2e8f0;--accent:#3157d5;--bg:#f7f9fd}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+.wrap{width:min(1060px,calc(100% - 36px));margin:auto}
+header{background:#fff;border-bottom:1px solid var(--line)}
+.nav{min-height:74px;display:flex;align-items:center;justify-content:space-between;gap:20px}
+.brand{display:flex;align-items:center;gap:11px;color:var(--ink);font-size:20px;font-weight:800}
+.brand:hover{text-decoration:none}.brand img{width:40px;height:40px;border-radius:11px}
+.links{display:flex;gap:22px;flex-wrap:wrap;font-size:14px;font-weight:700}
+.hero{padding:54px 0 30px;background:radial-gradient(ellipse at 82% 10%,#e0e7ff 0,transparent 45%)}
+.eyebrow{color:var(--accent);font-size:12px;font-weight:850;letter-spacing:.12em;text-transform:uppercase}
+h1{font-size:clamp(32px,5vw,50px);line-height:1.1;letter-spacing:-.045em;margin:14px 0}
+.lead{max-width:760px;color:var(--muted);font-size:18px;margin:0}
+.section{padding:26px 0 44px}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:20px;min-width:0}
+.card h3{margin:0 0 7px;font-size:18px;overflow-wrap:anywhere}
+.meta,.empty{color:var(--muted);font-size:14px}
+.empty{background:#fff;border:1px solid var(--line);border-radius:16px;padding:26px}
+code{background:#eef2ff;border-radius:6px;padding:2px 6px;font:14px ui-monospace,Consolas,monospace}
+footer{border-top:1px solid var(--line);padding:24px 0;color:var(--muted);font-size:14px}
+.foot{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+@media(max-width:860px){.grid{grid-template-columns:1fr}.nav{padding:13px 0;align-items:flex-start}.links{gap:12px;justify-content:flex-end;font-size:13px}}
+</style>
+</head>
+<body>
+<header><div class="wrap nav"><a class="brand" href="/"><img src="/logo.svg" alt=""><span>IrshadMCP</span></a><nav class="links"><a href="/">Home</a><a href="/about-mcp">MCP profile</a></nav></div></header>
+<main>
+<section class="hero"><div class="wrap"><div class="eyebrow">Public directory</div><h1>Published pages</h1><p class="lead">HTML pages published on this server through the MCP <code>publish_page</code> tool. Each one is served from its own permanent address.</p></div></section>
+<section class="section"><div class="wrap">${items ? `<div class="grid">${items}</div>` : body}</div></section>
+</main>
+<footer><div class="wrap foot"><span>IrshadMCP · Your notes, with AI</span><span><a href="/">Home</a> · <a href="/about-mcp">MCP profile</a></span></div></footer>
+</body>
+</html>`;
+}
