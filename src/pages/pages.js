@@ -16,8 +16,8 @@ function formatDate(value) {
 export function pagesIndexHtml(pages, { error = "" } = {}) {
   const items = (Array.isArray(pages) ? pages : [])
     .map(
-      p => `<article class="card"><h3><a href="/p/${encodeURIComponent(p.slug)}">${esc(p.title)}</a></h3>` +
-        `<div class="meta">/p/${esc(p.slug)} · Updated ${esc(formatDate(p.updated_at))}</div></article>`
+      p => `<article class="card"><h3><a href="/pages/${encodeURIComponent(p.slug)}">${esc(p.title)}</a></h3>` +
+        `<div class="meta">/pages/${esc(p.slug)} · Updated ${esc(formatDate(p.updated_at))}</div></article>`
     )
     .join("");
 

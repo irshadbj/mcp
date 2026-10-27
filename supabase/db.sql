@@ -29,3 +29,4 @@ ON public.pages (updated_at DESC);
 
 ALTER TABLE public.pages ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON public.pages FROM anon, authenticated;
+GRANT ALL ON public.pages TO service_role;

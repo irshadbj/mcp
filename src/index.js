@@ -17,7 +17,7 @@ const LOGO_SVG =
   '</svg>';
 
 const SERVER_DESCRIPTION =
-  "Irshad's private notes server. Create, search, read, update and delete notes with tags, and publish public HTML pages, all stored in Supabase.";
+  "Irshad's private notes server. Private notes are stored in the Supabase notes table; public HTML pages are stored separately in the pages table. For a public HTML page, use publish_page and never create_note. Pages are served at /pages/<slug>.";
 
 // Published pages are untrusted markup served from this origin, so scripts,
 // same-origin requests and framing are all denied.
@@ -62,7 +62,7 @@ async function handle(request, env) {
   }
 
   // Public directory of pages published through the MCP publish_page tool.
-  // Only titles, slugs and timestamps are listed; page HTML stays on /p/<slug>.
+  // Only titles, slugs and timestamps are listed; page HTML stays on /pages/<slug>.
   if ((url.pathname === "/pages" || url.pathname === "/pages/") && request.method === "GET") {
     const headers = {
       "Content-Type": "text/html; charset=utf-8",
@@ -87,7 +87,11 @@ async function handle(request, env) {
   }
 
   // Public pages published through the MCP publish_page tool.
-  if (request.method === "GET" && url.pathname.startsWith("/p/")) {
+  // /pages/<slug> is canonical; /p/<slug> remains a legacy alias.
+  if (
+    request.method === "GET" &&
+    (url.pathname.startsWith("/pages/") || url.pathname.startsWith("/p/"))
+  ) {
     const pageHeaders = {
       "Content-Type": "text/html; charset=utf-8",
       "X-Content-Type-Options": "nosniff",
@@ -95,8 +99,9 @@ async function handle(request, env) {
     };
 
     let slug = "";
+    const pagePrefix = url.pathname.startsWith("/pages/") ? "/pages/" : "/p/";
     try {
-      slug = decodeURIComponent(url.pathname.slice(3)).trim().toLowerCase();
+      slug = decodeURIComponent(url.pathname.slice(pagePrefix.length)).trim().toLowerCase();
     } catch {}
 
     if (!isValidSlug(slug)) return pageNotFound(pageHeaders);
@@ -239,7 +244,7 @@ async function handle(request, env) {
       tools: [
         {
           name: "create_note",
-          description: "Create a note.",
+          description: "Create a private note in the notes table. For a public HTML page, use publish_page instead; do not save published pages as notes.",
           inputSchema: {
             type: "object",
             properties: {
@@ -297,7 +302,7 @@ async function handle(request, env) {
         {
           name: "publish_page",
           description:
-            "Publish (create or replace) a public HTML page served at /p/<slug> on this server.",
+            "Publish (create or replace) a public HTML page in the separate Supabase pages table. Never use create_note for public pages. The page will be served at /pages/<slug> on this server.",
           inputSchema: {
             type: "object",
             properties: {
@@ -479,6 +484,7 @@ async function handle(request, env) {
         updated_at: now
       });
 
+      if (!saved) throw new Error("Page could not be saved to the pages table.");
       output = pageView(saved, url.origin);
 
     } else if (tool === "list_pages") {
@@ -510,7 +516,7 @@ async function handle(request, env) {
       if (!isValidSlug(slug)) throw new Error("Invalid slug.");
 
       if (!(await deletePage(env, slug))) throw new Error("Page not found.");
-      output = { deleted: true, slug, url: url.origin + "/p/" + slug };
+      output = { deleted: true, slug, url: url.origin + "/pages/" + slug };
 
     } else {
       return rpcError(id, -32602, `Unknown tool: ${tool}`);
@@ -890,7 +896,7 @@ function pageView(row, origin) {
     slug: row.slug,
     title: row.title,
     html: row.html,
-    url: origin + "/p/" + row.slug,
+    url: origin + "/pages/" + row.slug,
     created_at: row.created_at,
     updated_at: row.updated_at
   };
@@ -1222,16 +1228,16 @@ footer{border-top:1px solid var(--line);margin-top:24px;padding:24px 0;color:var
 </style></head><body>
 <header><div class="wrap nav"><a class="brand" href="/"><img src="/logo.svg" alt="IrshadMCP logo"><span>IrshadMCP</span></a><nav class="navlinks"><a href="/">Home</a><a href="#connection">Connection</a><a href="#capabilities">Capabilities</a><a href="/admin">Notes dashboard</a></nav></div></header>
 <main class="wrap"><section class="hero"><div class="eyebrow">MCP server profile</div><h1>Meet IrshadMCP.</h1><p class="lead">A personal notes server that lets compatible AI assistants securely work with your notes through the Model Context Protocol (MCP).</p>
-<div class="profile"><article class="panel"><div class="identity"><img src="/logo.svg" alt="IrshadMCP logo"><div><h2>IrshadMCP</h2><div class="muted">Personal notes · Remote MCP server</div><span class="pill">HTTP endpoint · JSON-RPC</span></div></div><p class="muted">Create, search, read, update and delete notes with tags, and publish public HTML pages. Everything is persisted in Supabase; the web dashboard is protected separately from MCP access.</p><div class="actions"><a class="btn" href="#connection">Get connection details</a><a class="btn alt" href="/logo.svg" target="_blank" rel="noopener">View logo SVG ↗</a></div></article>
+<div class="profile"><article class="panel"><div class="identity"><img src="/logo.svg" alt="IrshadMCP logo"><div><h2>IrshadMCP</h2><div class="muted">Personal notes · Remote MCP server</div><span class="pill">HTTP endpoint · JSON-RPC</span></div></div><p class="muted">Create, search, read, update and delete private notes with tags, and publish public HTML pages separately in the pages table. Everything is persisted in Supabase; the web dashboard is protected separately from MCP access.</p><div class="actions"><a class="btn" href="#connection">Get connection details</a><a class="btn alt" href="/logo.svg" target="_blank" rel="noopener">View logo SVG ↗</a></div></article>
 <aside class="panel"><h3>Server at a glance</h3><table><tr><td>Name</td><td>IrshadMCP</td></tr><tr><td>Protocol</td><td>Model Context Protocol</td></tr><tr><td>Transport</td><td>Remote HTTP · JSON-RPC</td></tr><tr><td>Storage</td><td>Supabase PostgreSQL</td></tr><tr><td>Version</td><td>1.1.0</td></tr><tr><td>Authentication</td><td>Bearer key if configured; dashboard uses separate credentials</td></tr></table></aside></div></section>
 <section class="section" id="connection"><article class="panel"><h2>Connection details</h2><p class="muted">Use this endpoint in an MCP-compatible client. Authentication must match the server configuration.</p><div class="endpoint"><code id="endpoint">${endpoint}</code><button id="copy" type="button">Copy endpoint</button></div><div class="actions"><a class="btn alt" href="/logo.svg" target="_blank" rel="noopener">Logo URL</a><a class="btn alt" href="https://modelcontextprotocol.io/" target="_blank" rel="noopener noreferrer">MCP website ↗</a><a class="btn alt" href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt" target="_blank" rel="noopener noreferrer">ChatGPT connection guide ↗</a></div><p class="muted" style="margin-bottom:0">Public information page only. It does not display secrets, note contents, or authentication keys.</p></article></section>
 <section class="section" id="capabilities"><h2>Available tools</h2><p class="muted">These tools are exposed to connected clients for note management.</p><div class="grid">
 <article class="card"><div class="symbol">＋</div><h3>Create notes</h3><p class="muted">Save a note with a title, content and optional tags.</p><span class="tool">create_note</span></article>
 <article class="card"><div class="symbol">⌕</div><h3>Search and read</h3><p class="muted">Find notes by title, content or tags, then retrieve a note by ID.</p><span class="tool">list_notes</span><span class="tool">get_note</span></article>
 <article class="card"><div class="symbol">↻</div><h3>Maintain notes</h3><p class="muted">Edit titles, content and tags, or permanently delete a note when requested.</p><span class="tool">update_note</span><span class="tool">delete_note</span></article>
-<article class="card"><div class="symbol">◧</div><h3>Publish pages</h3><p class="muted">Publish, read and remove public HTML pages served from this server at <code>/p/your-slug</code>.</p><span class="tool">publish_page</span><span class="tool">list_pages</span><span class="tool">get_page</span><span class="tool">delete_page</span></article>
+<article class="card"><div class="symbol">◧</div><h3>Publish pages</h3><p class="muted">Publish, read and remove public HTML pages saved separately from notes and served at <code>/pages/your-slug</code>.</p><span class="tool">publish_page</span><span class="tool">list_pages</span><span class="tool">get_page</span><span class="tool">delete_page</span></article>
 </div></section>
-<section class="section"><article class="panel"><h2>Useful links</h2><table><tr><td>Home page</td><td><a href="/">IrshadMCP landing page ↗</a></td></tr><tr><td>MCP endpoint</td><td><a href="/mcp">/mcp</a> <span class="muted">(POST requests; a browser GET is not a health check)</span></td></tr><tr><td>Logo</td><td><a href="/logo.svg">/logo.svg</a></td></tr><tr><td>Published pages</td><td><code>/p/&lt;slug&gt;</code> <span class="muted">(HTML published through the publish_page tool)</span></td></tr><tr><td>Notes dashboard</td><td><a href="/admin">/admin</a> <span class="muted">(requires dashboard login)</span></td></tr><tr><td>MCP specification</td><td><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener noreferrer">modelcontextprotocol.io ↗</a></td></tr><tr><td>ChatGPT setup</td><td><a href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt" target="_blank" rel="noopener noreferrer">Official connection guide ↗</a></td></tr></table></article></section></main>
+<section class="section"><article class="panel"><h2>Useful links</h2><table><tr><td>Home page</td><td><a href="/">IrshadMCP landing page ↗</a></td></tr><tr><td>MCP endpoint</td><td><a href="/mcp">/mcp</a> <span class="muted">(POST requests; a browser GET is not a health check)</span></td></tr><tr><td>Logo</td><td><a href="/logo.svg">/logo.svg</a></td></tr><tr><td>Published pages</td><td><a href="/pages">/pages</a> · <code>/pages/&lt;slug&gt;</code> <span class="muted">(HTML published through the publish_page tool)</span></td></tr><tr><td>Notes dashboard</td><td><a href="/admin">/admin</a> <span class="muted">(requires dashboard login)</span></td></tr><tr><td>MCP specification</td><td><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener noreferrer">modelcontextprotocol.io ↗</a></td></tr><tr><td>ChatGPT setup</td><td><a href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt" target="_blank" rel="noopener noreferrer">Official connection guide ↗</a></td></tr></table></article></section></main>
 <footer><div class="wrap foot"><span>IrshadMCP · Personal notes for AI workflows</span><a href="/">Back to home ↑</a></div></footer>
 <script>document.getElementById("copy").addEventListener("click",async()=>{const b=document.getElementById("copy");try{await navigator.clipboard.writeText(document.getElementById("endpoint").textContent);b.textContent="Copied!";}catch{b.textContent="Copy unavailable — select the URL";}setTimeout(()=>b.textContent="Copy endpoint",2000);});</script></body></html>`;
 }
