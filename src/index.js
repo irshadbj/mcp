@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { homeHtml } from "./pages/home.js";
 import { dashboardHtml } from "./pages/admin.js";
 import { pagesIndexHtml } from "./pages/pages.js";
+import { swScript } from "./sw.js";
 
 const LOGO_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">' +
@@ -17,7 +18,7 @@ const LOGO_SVG =
   '</svg>';
 
 const SERVER_DESCRIPTION =
-  "Irshad's private notes server. Private notes are stored in the Supabase notes table; public HTML pages are stored separately in the pages table. For a public HTML page, use publish_page and never create_note. Pages are served at /pages/<slug>.";
+  "Irshad's private notes server. Private notes are stored in the Supabase notes table, reusable skills in the skills table, and public HTML pages separately in the pages table. For a public HTML page, use publish_page and never create_note; pages can be grouped into a booklet on the /pages shelf and are served at /pages/<slug>.";
 
 // Published pages are untrusted markup served from this origin, so scripts,
 // same-origin requests and framing are all denied.
@@ -47,6 +48,19 @@ async function handle(request, env) {
         "Content-Type": "image/svg+xml; charset=utf-8",
         "Cache-Control": "public, max-age=86400",
         "Access-Control-Allow-Origin": "*"
+      }
+    });
+  }
+
+  // Service worker: network-first, so visited pages are cached and only
+  // served from the cache when the browser is offline.
+  if (request.method === "GET" && url.pathname === "/sw.js") {
+    return new Response(swScript, {
+      headers: {
+        "Content-Type": "text/javascript; charset=utf-8",
+        "Cache-Control": "no-cache",
+        "Service-Worker-Allowed": "/",
+        "X-Content-Type-Options": "nosniff"
       }
     });
   }
@@ -125,7 +139,7 @@ async function handle(request, env) {
 
     if (!row) return pageNotFound(pageHeaders);
 
-    return new Response(row.html, {
+    return new Response(row.content ?? row.html ?? "", {
       headers: { ...pageHeaders, "Cache-Control": "public, max-age=60" }
     });
   }
@@ -300,9 +314,66 @@ async function handle(request, env) {
           }
         },
         {
+          name: "create_skill",
+          description: "Create a skill: a reusable how-to guide or recipe stored in the skills table, separate from notes and pages.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              title: { type: "string", minLength: 1, maxLength: 200 },
+              content: { type: "string", minLength: 1, maxLength: 50000 },
+              tags: { type: "array", items: { type: "string" }, maxItems: 20 }
+            },
+            required: ["title", "content"]
+          }
+        },
+        {
+          name: "list_skills",
+          description: "List skills or search their title, content and tags, optionally filtered by tag.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: { type: "string" },
+              tag: { type: "string", maxLength: 40 },
+              limit: { type: "integer", minimum: 1, maximum: 100 }
+            }
+          }
+        },
+        {
+          name: "get_skill",
+          description: "Read a skill by ID.",
+          inputSchema: {
+            type: "object",
+            properties: { id: { type: "string" } },
+            required: ["id"]
+          }
+        },
+        {
+          name: "update_skill",
+          description: "Update a skill by ID. Supply one or more fields.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              content: { type: "string" },
+              tags: { type: "array", items: { type: "string" } }
+            },
+            required: ["id"]
+          }
+        },
+        {
+          name: "delete_skill",
+          description: "Permanently delete a skill by ID.",
+          inputSchema: {
+            type: "object",
+            properties: { id: { type: "string" } },
+            required: ["id"]
+          }
+        },
+        {
           name: "publish_page",
           description:
-            "Publish (create or replace) a public HTML page in the separate Supabase pages table. Never use create_note for public pages. The page will be served at /pages/<slug> on this server.",
+            "Publish (create or replace) a public HTML page in the separate Supabase pages table. Never use create_note for public pages. Optionally place it in a booklet on the /pages shelf. The page will be served at /pages/<slug> on this server.",
           inputSchema: {
             type: "object",
             properties: {
@@ -312,7 +383,12 @@ async function handle(request, env) {
                 description: "Optional URL slug; derived from the title when omitted."
               },
               title: { type: "string", minLength: 1, maxLength: 200 },
-              html: { type: "string", minLength: 1, maxLength: 200000 }
+              html: { type: "string", minLength: 1, maxLength: 200000 },
+              booklet: {
+                type: "string",
+                maxLength: 80,
+                description: "Optional booklet (group) this page belongs to on the /pages shelf."
+              }
             },
             required: ["title", "html"]
           }
@@ -455,11 +531,96 @@ async function handle(request, env) {
 
       output = { deleted: true, id: noteId };
 
+    } else if (tool === "create_skill") {
+      const title = cleanString(args.title, 200);
+      const content = cleanString(args.content, 50000, false);
+
+      if (!title || !content) {
+        throw new Error("title and content are required.");
+      }
+
+      const tags = cleanTags(args.tags);
+      const now = new Date().toISOString();
+
+      output = parseNote(
+        await insertSkill(env, {
+          id: crypto.randomUUID(),
+          title,
+          content,
+          tags: JSON.stringify(tags),
+          created_at: now,
+          updated_at: now
+        })
+      );
+
+    } else if (tool === "list_skills") {
+      const limit = Math.max(
+        1,
+        Math.min(100, Number.parseInt(args.limit, 10) || 25)
+      );
+      const query = typeof args.query === "string"
+        ? args.query.trim().slice(0, 200)
+        : "";
+      const tag = typeof args.tag === "string"
+        ? args.tag.trim().slice(0, 40)
+        : "";
+
+      output = (await listSkills(env, { query, tag, limit })).map(parseNote);
+
+    } else if (tool === "get_skill") {
+      const skillId = cleanString(args.id, 100);
+      const row = await getSkill(env, skillId);
+
+      if (!row) throw new Error("Skill not found.");
+      output = parseNote(row);
+
+    } else if (tool === "update_skill") {
+      const skillId = cleanString(args.id, 100);
+      const current = await getSkill(env, skillId);
+
+      if (!current) throw new Error("Skill not found.");
+
+      const title = args.title === undefined
+        ? current.title
+        : cleanString(args.title, 200);
+      const content = args.content === undefined
+        ? current.content
+        : cleanString(args.content, 50000, false);
+      const tags = args.tags === undefined
+        ? parseTags(current.tags)
+        : cleanTags(args.tags);
+
+      if (!title || !content) {
+        throw new Error("title and content cannot be empty.");
+      }
+
+      const updated = await updateSkill(env, skillId, {
+        title,
+        content,
+        tags: JSON.stringify(tags),
+        updated_at: new Date().toISOString()
+      });
+
+      if (!updated) throw new Error("Skill not found.");
+      output = parseNote(updated);
+
+    } else if (tool === "delete_skill") {
+      const skillId = cleanString(args.id, 100);
+
+      if (!(await deleteSkill(env, skillId))) {
+        throw new Error("Skill not found.");
+      }
+
+      output = { deleted: true, id: skillId };
+
     } else if (tool === "publish_page") {
       const title = cleanString(args.title, 200);
-      const html = cleanString(args.html, 200000, false);
+      // Stored in the pages.content column: it may hold HTML or plain text,
+      // so the column keeps the neutral "content" name.
+      const content = cleanString(args.html, 200000, false);
+      const booklet = cleanString(args.booklet, 80);
 
-      if (!title || !html) {
+      if (!title || !content) {
         throw new Error("title and html are required.");
       }
 
@@ -479,7 +640,8 @@ async function handle(request, env) {
       const saved = await savePage(env, slug, {
         slug,
         title,
-        html,
+        content,
+        booklet: booklet || (existing && existing.booklet) || "",
         created_at: (existing && existing.created_at) || now,
         updated_at: now
       });
@@ -584,7 +746,7 @@ async function sb(env, table, query = "", init = {}) {
   return data;
 }
 
-async function listNotes(env, { query = "", tag = "", limit = 25 }) {
+async function listNotes(env, { query = "", tag = "", limit = 25 }, table = "notes") {
   const pairs = [
     ["select", "*"],
     ["order", "updated_at.desc"],
@@ -603,20 +765,20 @@ async function listNotes(env, { query = "", tag = "", limit = 25 }) {
     pairs.push(["tags", "ilike.*" + cleanFilter(tag) + "*"]);
   }
 
-  return (await sb(env, "notes", qs(pairs))) || [];
+  return (await sb(env, table, qs(pairs))) || [];
 }
 
-async function getNote(env, id) {
+async function getNote(env, id, table = "notes") {
   const rows = await sb(
     env,
-    "notes",
+    table,
     qs([["select", "*"], ["id", "eq." + id], ["limit", "1"]])
   );
   return rows && rows[0] ? rows[0] : null;
 }
 
-async function insertNote(env, row) {
-  const rows = await sb(env, "notes", "", {
+async function insertNote(env, row, table = "notes") {
+  const rows = await sb(env, table, "", {
     method: "POST",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify(row)
@@ -624,8 +786,8 @@ async function insertNote(env, row) {
   return rows && rows[0] ? rows[0] : null;
 }
 
-async function updateNote(env, id, patch) {
-  const rows = await sb(env, "notes", qs([["id", "eq." + id]]), {
+async function updateNote(env, id, patch, table = "notes") {
+  const rows = await sb(env, table, qs([["id", "eq." + id]]), {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify(patch)
@@ -633,8 +795,8 @@ async function updateNote(env, id, patch) {
   return rows && rows[0] ? rows[0] : null;
 }
 
-async function deleteNote(env, id) {
-  const rows = await sb(env, "notes", qs([["id", "eq." + id]]), {
+async function deleteNote(env, id, table = "notes") {
+  const rows = await sb(env, table, qs([["id", "eq." + id]]), {
     method: "DELETE",
     headers: { Prefer: "return=representation" }
   });
@@ -666,10 +828,23 @@ async function getPage(env, slug) {
 }
 
 async function savePage(env, slug, row) {
+  try {
+    return await postPage(env, { ...row, slug });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (!/content/i.test(msg)) throw error;
+    // Some databases still have the column named html instead of content.
+    const legacy = { ...row, slug, html: row.content };
+    delete legacy.content;
+    return await postPage(env, legacy);
+  }
+}
+
+async function postPage(env, body) {
   const rows = await sb(env, "pages", qs([["on_conflict", "slug"]]), {
     method: "POST",
     headers: { Prefer: "return=representation,resolution=merge-duplicates" },
-    body: JSON.stringify({ ...row, slug })
+    body: JSON.stringify(body)
   });
   return rows && rows[0] ? rows[0] : null;
 }
@@ -742,6 +917,13 @@ function parseNote(row) {
   const tags = parseTags(row.tags);
   return { ...row, tags, html: renderNoteHtml(row.content) };
 }
+
+/* Skills reuse the note row shape but live in the skills table. */
+const listSkills = (env, opts) => listNotes(env, opts, "skills");
+const getSkill = (env, id) => getNote(env, id, "skills");
+const insertSkill = (env, row) => insertNote(env, row, "skills");
+const updateSkill = (env, id, patch) => updateNote(env, id, patch, "skills");
+const deleteSkill = (env, id) => deleteNote(env, id, "skills");
 
 /* ---------- plain text -> safe HTML rendering ---------- */
 
@@ -895,7 +1077,10 @@ function pageView(row, origin) {
   return {
     slug: row.slug,
     title: row.title,
-    html: row.html,
+    booklet: row.booklet || "",
+    // The database column is content (HTML or plain text); html stays the
+    // MCP-facing field name.
+    html: row.content ?? row.html ?? "",
     url: origin + "/pages/" + row.slug,
     created_at: row.created_at,
     updated_at: row.updated_at
@@ -1050,7 +1235,7 @@ async function handleDashboardApi(request, env, url) {
     });
 
     return Response.json(
-      { id, title, content, tags, created_at: now, updated_at: now },
+      { id, title, content, tags, html: renderNoteHtml(content), created_at: now, updated_at: now },
       { status: 201, headers }
     );
   }
@@ -1186,6 +1371,123 @@ async function handleDashboardApi(request, env, url) {
     }
   }
 
+  if (request.method === "GET" && url.pathname === "/api/skills") {
+    const query = (url.searchParams.get("q") || "").trim().slice(0, 200);
+    const tag = (url.searchParams.get("tag") || "").trim().slice(0, 40);
+
+    const limit = Math.max(
+      1,
+      Math.min(100, Number.parseInt(url.searchParams.get("limit") || "100", 10) || 100)
+    );
+
+    const rows = await listSkills(env, { query, tag, limit });
+    return Response.json(rows.map(parseNote), { headers });
+  }
+
+  if (request.method === "POST" && url.pathname === "/api/skills") {
+    const body = await safeJson(request);
+
+    if (!body) {
+      return Response.json({ error: "Invalid JSON body" }, { status: 400, headers });
+    }
+
+    const title = cleanString(body.title, 200);
+    const content = cleanString(body.content, 50000, false);
+
+    if (!title || !content) {
+      return Response.json(
+        { error: "Title and content are required (max title 200, content 50000 characters)." },
+        { status: 400, headers }
+      );
+    }
+
+    const tags = cleanTags(
+      Array.isArray(body.tags) ? body.tags : String(body.tags || "").split(",")
+    );
+
+    const id = crypto.randomUUID();
+    const now = new Date().toISOString();
+
+    await insertSkill(env, {
+      id,
+      title,
+      content,
+      tags: JSON.stringify(tags),
+      created_at: now,
+      updated_at: now
+    });
+
+    return Response.json(
+      { id, title, content, tags, html: renderNoteHtml(content), created_at: now, updated_at: now },
+      { status: 201, headers }
+    );
+  }
+
+  const skillMatch = url.pathname.match(/^\/api\/skills\/([^/]+)$/);
+
+  if (skillMatch) {
+    let skillId;
+
+    try {
+      skillId = decodeURIComponent(skillMatch[1]);
+    } catch {
+      return Response.json({ error: "Invalid skill ID" }, { status: 400, headers });
+    }
+
+    if (request.method === "GET") {
+      const row = await getSkill(env, skillId);
+
+      return row
+        ? Response.json(parseNote(row), { headers })
+        : Response.json({ error: "Skill not found" }, { status: 404, headers });
+    }
+
+    if (request.method === "PUT") {
+      const body = await safeJson(request);
+
+      if (!body) {
+        return Response.json({ error: "Invalid JSON body" }, { status: 400, headers });
+      }
+
+      const current = await getSkill(env, skillId);
+
+      if (!current) {
+        return Response.json({ error: "Skill not found" }, { status: 404, headers });
+      }
+
+      const title = body.title === undefined
+        ? current.title
+        : cleanString(body.title, 200);
+      const content = body.content === undefined
+        ? current.content
+        : cleanString(body.content, 50000, false);
+      const tags = body.tags === undefined
+        ? parseTags(current.tags)
+        : cleanTags(Array.isArray(body.tags) ? body.tags : String(body.tags || "").split(","));
+
+      if (!title || !content) {
+        return Response.json({ error: "Title and content cannot be empty." }, { status: 400, headers });
+      }
+
+      const updated = await updateSkill(env, skillId, {
+        title,
+        content,
+        tags: JSON.stringify(tags),
+        updated_at: new Date().toISOString()
+      });
+
+      return updated
+        ? Response.json(parseNote(updated), { headers })
+        : Response.json({ error: "Skill not found" }, { status: 404, headers });
+    }
+
+    if (request.method === "DELETE") {
+      return (await deleteSkill(env, skillId))
+        ? Response.json({ deleted: true, id: skillId }, { headers })
+        : Response.json({ error: "Skill not found" }, { status: 404, headers });
+    }
+  }
+
   return Response.json({ error: "Not found" }, { status: 404, headers });
 }
 
@@ -1235,9 +1537,10 @@ footer{border-top:1px solid var(--line);margin-top:24px;padding:24px 0;color:var
 <article class="card"><div class="symbol">＋</div><h3>Create notes</h3><p class="muted">Save a note with a title, content and optional tags.</p><span class="tool">create_note</span></article>
 <article class="card"><div class="symbol">⌕</div><h3>Search and read</h3><p class="muted">Find notes by title, content or tags, then retrieve a note by ID.</p><span class="tool">list_notes</span><span class="tool">get_note</span></article>
 <article class="card"><div class="symbol">↻</div><h3>Maintain notes</h3><p class="muted">Edit titles, content and tags, or permanently delete a note when requested.</p><span class="tool">update_note</span><span class="tool">delete_note</span></article>
-<article class="card"><div class="symbol">◧</div><h3>Publish pages</h3><p class="muted">Publish, read and remove public HTML pages saved separately from notes and served at <code>/pages/your-slug</code>.</p><span class="tool">publish_page</span><span class="tool">list_pages</span><span class="tool">get_page</span><span class="tool">delete_page</span></article>
+<article class="card"><div class="symbol">✦</div><h3>Skill library</h3><p class="muted">Save reusable how-to skills with titles, content and tags, kept separate from notes.</p><span class="tool">create_skill</span><span class="tool">list_skills</span><span class="tool">get_skill</span><span class="tool">update_skill</span><span class="tool">delete_skill</span></article>
+<article class="card"><div class="symbol">◧</div><h3>Publish pages</h3><p class="muted">Publish, read and remove public HTML pages saved separately from notes, arranged in booklets on the <code>/pages</code> shelf and served at <code>/pages/your-slug</code>.</p><span class="tool">publish_page</span><span class="tool">list_pages</span><span class="tool">get_page</span><span class="tool">delete_page</span></article>
 </div></section>
 <section class="section"><article class="panel"><h2>Useful links</h2><table><tr><td>Home page</td><td><a href="/">IrshadMCP landing page ↗</a></td></tr><tr><td>MCP endpoint</td><td><a href="/mcp">/mcp</a> <span class="muted">(POST requests; a browser GET is not a health check)</span></td></tr><tr><td>Logo</td><td><a href="/logo.svg">/logo.svg</a></td></tr><tr><td>Published pages</td><td><a href="/pages">/pages</a> · <code>/pages/&lt;slug&gt;</code> <span class="muted">(HTML published through the publish_page tool)</span></td></tr><tr><td>Notes dashboard</td><td><a href="/admin">/admin</a> <span class="muted">(requires dashboard login)</span></td></tr><tr><td>MCP specification</td><td><a href="https://modelcontextprotocol.io/" target="_blank" rel="noopener noreferrer">modelcontextprotocol.io ↗</a></td></tr><tr><td>ChatGPT setup</td><td><a href="https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt" target="_blank" rel="noopener noreferrer">Official connection guide ↗</a></td></tr></table></article></section></main>
 <footer><div class="wrap foot"><span>IrshadMCP · Personal notes for AI workflows</span><a href="/">Back to home ↑</a></div></footer>
-<script>document.getElementById("copy").addEventListener("click",async()=>{const b=document.getElementById("copy");try{await navigator.clipboard.writeText(document.getElementById("endpoint").textContent);b.textContent="Copied!";}catch{b.textContent="Copy unavailable — select the URL";}setTimeout(()=>b.textContent="Copy endpoint",2000);});</script></body></html>`;
+<script>document.getElementById("copy").addEventListener("click",async()=>{const b=document.getElementById("copy");try{await navigator.clipboard.writeText(document.getElementById("endpoint").textContent);b.textContent="Copied!";}catch{b.textContent="Copy unavailable — select the URL";}setTimeout(()=>b.textContent="Copy endpoint",2000);});if("serviceWorker" in navigator)navigator.serviceWorker.register("/sw.js").catch(()=>{});</script></body></html>`;
 }
