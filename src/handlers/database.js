@@ -38,7 +38,7 @@ async function request(env, table, query = "", init = {}) {
 }
 
 function cleanFilter(value) {
-  return String(value).replace(/[%_,()"]/g, "");
+  return String(value).replace(/[%_,()"{}\\]/g, "");
 }
 
 export function dbReady(env) {
@@ -165,3 +165,93 @@ export const getSkill = (env, id) => getNote(env, id, "skills");
 export const insertSkill = (env, row) => insertNote(env, row, "skills");
 export const updateSkill = (env, id, patch) => updateNote(env, id, patch, "skills");
 export const deleteSkill = (env, id) => deleteNote(env, id, "skills");
+
+function ownerId(env) {
+  return env.USER_ID || "system_default";
+}
+
+export async function listOwnedRecords(
+  env,
+  table,
+  { query = "", limit = 25, searchColumns = ["title"], tag = "", completed } = {}
+) {
+  const pairs = [
+    ["select", "*"],
+    ["user_id", "eq." + ownerId(env)],
+    ["order", "updated_at.desc"],
+    ["limit", String(limit)]
+  ];
+
+  if (query) {
+    const pattern = '"*' + query.replace(/[\\"]/g, "\\$&") + '*"';
+    pairs.push([
+      "or",
+      "(" + searchColumns.map(column => `${column}.ilike.${pattern}`).join(",") + ")"
+    ]);
+  }
+
+  if (tag) {
+    pairs.push(["tags", "cs.{" + cleanFilter(tag) + "}"]);
+  }
+  if (typeof completed === "boolean") {
+    pairs.push(["is_completed", "eq." + completed]);
+  }
+
+  return (await request(env, table, qs(pairs))) || [];
+}
+
+export async function getOwnedRecord(env, table, idColumn, id) {
+  const rows = await request(
+    env,
+    table,
+    qs([
+      ["select", "*"],
+      ["user_id", "eq." + ownerId(env)],
+      [idColumn, "eq." + id],
+      ["limit", "1"]
+    ])
+  );
+  return rows && rows[0] ? rows[0] : null;
+}
+
+export async function insertOwnedRecord(env, table, row) {
+  const rows = await request(env, table, "", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({ ...row, user_id: ownerId(env) })
+  });
+  return rows && rows[0] ? rows[0] : null;
+}
+
+export async function updateOwnedRecord(env, table, idColumn, id, patch) {
+  const rows = await request(
+    env,
+    table,
+    qs([
+      ["user_id", "eq." + ownerId(env)],
+      [idColumn, "eq." + id]
+    ]),
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify(patch)
+    }
+  );
+  return rows && rows[0] ? rows[0] : null;
+}
+
+export async function deleteOwnedRecord(env, table, idColumn, id) {
+  const rows = await request(
+    env,
+    table,
+    qs([
+      ["user_id", "eq." + ownerId(env)],
+      [idColumn, "eq." + id]
+    ]),
+    {
+      method: "DELETE",
+      headers: { Prefer: "return=representation" }
+    }
+  );
+  return Array.isArray(rows) && rows.length > 0;
+}
