@@ -4,6 +4,7 @@ import { Script } from "node:vm";
 import app from "../src/index.js";
 import { dashboardHtml } from "../src/pages/admin.js";
 import { pagesIndexHtml } from "../src/pages/pages.js";
+import { issueSessionToken } from "../src/handlers/oauth.js";
 
 test("deployment entrypoint loads and serves the public logo", async () => {
   const response = await app.request("/logo.svg");
@@ -16,14 +17,14 @@ test("MCP advertises and persists memories and tasks", async () => {
   const previous = {
     url: process.env.SUPABASE_URL,
     key: process.env.SUPABASE_SERVICE_ROLE_KEY,
-    userId: process.env.USER_ID,
-    dashboardPassword: process.env.DASHBOARD_PASSWORD,
+    oauthSecret: process.env.OAUTH_SESSION_SECRET,
     fetch: globalThis.fetch
   };
   const calls = [];
   process.env.SUPABASE_URL = "https://supabase.example";
   process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-key";
-  process.env.USER_ID = "test-user";
+  process.env.OAUTH_SESSION_SECRET = "test oauth session secret that is at least 32 chars";
+  const accessToken = await issueSessionToken({ sub: "test-google-user" }, process.env);
   const records = new Map();
   globalThis.fetch = async (input, init = {}) => {
     calls.push({ url: String(input), init });
@@ -55,7 +56,7 @@ test("MCP advertises and persists memories and tasks", async () => {
   const rpc = async (id, name, args) => {
     const response = await app.request("/mcp", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: "Bearer " + accessToken },
       body: JSON.stringify({
         jsonrpc: "2.0",
         id,
@@ -84,11 +85,15 @@ test("MCP advertises and persists memories and tasks", async () => {
       arguments: { title: "Note", content: "Note body" }
     });
     assert.match(calls.at(-1).url, /\/rest\/v1\/notes$/);
+    assert.equal(JSON.parse(calls.at(-1).init.body).user_id, "google:test-google-user");
     await rpc(3, "tools/call", {
       name: "create_skill",
       arguments: { title: "Guide", content: "Steps" }
     });
     assert.match(calls.at(-1).url, /\/rest\/v1\/skills$/);
+    assert.equal(JSON.parse(calls.at(-1).init.body).user_id, "google:test-google-user");
+    await rpc(3, "tools/call", { name: "list_notes", arguments: {} });
+    assert.equal(new URL(calls.at(-1).url).searchParams.get("user_id"), "eq.google:test-google-user");
     const publishedPage = await rpc(4, "tools/call", {
       name: "publish_page",
       arguments: {
@@ -97,7 +102,10 @@ test("MCP advertises and persists memories and tasks", async () => {
         booklet: "Research Notes"
       }
     });
-    assert.match(calls.at(-1).url, /\/rest\/v1\/pages\?/);
+    assert.match(calls.at(-1).url, /\/rest\/v1\/pages$/);
+    assert.equal(JSON.parse(calls.at(-1).init.body).user_id, "google:test-google-user");
+    await rpc(3, "tools/call", { name: "list_pages", arguments: {} });
+    assert.equal(new URL(calls.at(-1).url).searchParams.get("user_id"), "eq.google:test-google-user");
     assert.equal(
       JSON.parse(publishedPage.result.content[0].text).url,
       "http://localhost/pages/Research%20Notes/public-page"
@@ -110,7 +118,7 @@ test("MCP advertises and persists memories and tasks", async () => {
     assert.equal(memory.result.isError, undefined);
     const memoryCall = calls.at(-1);
     assert.match(memoryCall.url, /\/rest\/v1\/memories$/);
-    assert.equal(JSON.parse(memoryCall.init.body).user_id, "test-user");
+    assert.equal(JSON.parse(memoryCall.init.body).user_id, "google:test-google-user");
     assert.deepEqual(JSON.parse(memoryCall.init.body).tags, ["work"]);
     const memoryId = JSON.parse(memoryCall.init.body).id;
     await rpc(3, "tools/call", {
@@ -136,7 +144,7 @@ test("MCP advertises and persists memories and tasks", async () => {
     const taskCall = calls.at(-1);
     assert.match(taskCall.url, /\/rest\/v1\/tasks$/);
     const taskRow = JSON.parse(taskCall.init.body);
-    assert.equal(taskRow.user_id, "test-user");
+    assert.equal(taskRow.user_id, "google:test-google-user");
     assert.equal(taskRow.due_date, "2026-11-10");
     assert.equal(taskRow.is_completed, false);
     const taskId = taskRow.task_id;
@@ -156,7 +164,7 @@ test("MCP advertises and persists memories and tasks", async () => {
       arguments: { completed: false }
     });
     const listUrl = new URL(calls.at(-1).url);
-    assert.equal(listUrl.searchParams.get("user_id"), "eq.test-user");
+    assert.equal(listUrl.searchParams.get("user_id"), "eq.google:test-google-user");
     assert.equal(listUrl.searchParams.get("is_completed"), "eq.false");
     await rpc(10, "tools/call", {
       name: "delete_task",
@@ -168,44 +176,118 @@ test("MCP advertises and persists memories and tasks", async () => {
     else process.env.SUPABASE_URL = previous.url;
     if (previous.key === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
     else process.env.SUPABASE_SERVICE_ROLE_KEY = previous.key;
-    if (previous.userId === undefined) delete process.env.USER_ID;
-    else process.env.USER_ID = previous.userId;
-    if (previous.dashboardPassword === undefined) delete process.env.DASHBOARD_PASSWORD;
-    else process.env.DASHBOARD_PASSWORD = previous.dashboardPassword;
+    if (previous.oauthSecret === undefined) delete process.env.OAUTH_SESSION_SECRET;
+    else process.env.OAUTH_SESSION_SECRET = previous.oauthSecret;
     globalThis.fetch = previous.fetch;
   }
 });
 
-test("public and dashboard routes remain separately wired", async () => {
+test("Google OAuth signs in without persisting profile data", async () => {
+  const previous = {
+    clientId: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    redirectUri: process.env.GOOGLE_REDIRECT_URI,
+    oauthSecret: process.env.OAUTH_SESSION_SECRET,
+    fetch: globalThis.fetch
+  };
+  process.env.GOOGLE_CLIENT_ID = "test-client-id";
+  process.env.GOOGLE_CLIENT_SECRET = "test-client-secret";
+  process.env.GOOGLE_REDIRECT_URI = "https://app.example/oauth/callback";
+  process.env.OAUTH_SESSION_SECRET = "oauth flow test secret that is at least 32 characters";
+  const googleCalls = [];
+  globalThis.fetch = async (input, init = {}) => {
+    googleCalls.push(String(input));
+    if (String(input) === "https://oauth2.googleapis.com/token") {
+      return Response.json({ access_token: "google-access-token" });
+    }
+    return Response.json({
+      sub: "stable-google-sub",
+      email: "private@example.com",
+      email_verified: true,
+      name: "Not stored"
+    });
+  };
+
+  try {
+    const login = await app.request("/oauth/login?next=%2Fadmin");
+    assert.equal(login.status, 302);
+    const authorization = new URL(login.headers.get("location"));
+    assert.equal(authorization.hostname, "accounts.google.com");
+    assert.equal(authorization.searchParams.get("client_id"), "test-client-id");
+    assert.equal(authorization.searchParams.get("redirect_uri"), process.env.GOOGLE_REDIRECT_URI);
+    assert.equal(authorization.searchParams.has("prompt"), false);
+    assert.equal(authorization.searchParams.get("code_challenge_method"), "S256");
+    assert.ok(authorization.searchParams.get("code_challenge"));
+    const stateCookie = login.headers.get("set-cookie").split(";")[0];
+    const callback = await app.request(
+      "https://app.example/oauth/callback?code=one-time-code&state=" +
+        encodeURIComponent(authorization.searchParams.get("state")),
+      { headers: { Cookie: stateCookie } }
+    );
+    assert.equal(callback.status, 302);
+    assert.equal(callback.headers.get("location"), "/admin");
+    const sessionCookie = callback.headers.get("set-cookie").match(/irshad_oauth_session=([^;]+)/)[1];
+    const sessionResponse = await app.request("/oauth/session", {
+      headers: { Cookie: "irshad_oauth_session=" + sessionCookie }
+    });
+    const session = await sessionResponse.json();
+    assert.equal(session.user.user_id, "google:stable-google-sub");
+    assert.doesNotMatch(JSON.stringify(session), /private@example\.com|Not stored/);
+    const cookieDashboard = await app.request("/admin", {
+      headers: { Cookie: "irshad_oauth_session=" + sessionCookie }
+    });
+    assert.equal(cookieDashboard.status, 200);
+    assert.equal(googleCalls.length, 2);
+
+    const replay = await app.request(
+      "https://app.example/oauth/callback?code=one-time-code&state=" +
+        encodeURIComponent(authorization.searchParams.get("state"))
+    );
+    assert.equal(replay.status, 400);
+  } finally {
+    if (previous.clientId === undefined) delete process.env.GOOGLE_CLIENT_ID;
+    else process.env.GOOGLE_CLIENT_ID = previous.clientId;
+    if (previous.clientSecret === undefined) delete process.env.GOOGLE_CLIENT_SECRET;
+    else process.env.GOOGLE_CLIENT_SECRET = previous.clientSecret;
+    if (previous.redirectUri === undefined) delete process.env.GOOGLE_REDIRECT_URI;
+    else process.env.GOOGLE_REDIRECT_URI = previous.redirectUri;
+    if (previous.oauthSecret === undefined) delete process.env.OAUTH_SESSION_SECRET;
+    else process.env.OAUTH_SESSION_SECRET = previous.oauthSecret;
+    globalThis.fetch = previous.fetch;
+  }
+});
+
+test("public routes remain open and dashboard starts Google sign-in", async () => {
   const about = await app.request("/about-mcp");
   assert.equal(about.status, 200);
   assert.match(await about.text(), /IrshadMCP/);
 
-  const previous = process.env.DASHBOARD_PASSWORD;
-  process.env.DASHBOARD_PASSWORD = "test-password";
-  try {
-    const dashboard = await app.request("/admin");
-    assert.equal(dashboard.status, 401);
-  } finally {
-    if (previous === undefined) delete process.env.DASHBOARD_PASSWORD;
-    else process.env.DASHBOARD_PASSWORD = previous;
-  }
+  const dashboard = await app.request("/admin");
+  assert.equal(dashboard.status, 302);
+  assert.equal(dashboard.headers.get("location"), "/oauth/login?next=%2Fadmin");
+  assert.equal((await app.request("/api/notes")).status, 401);
+  const anonymousMcp = await app.request("/mcp", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })
+  });
+  assert.equal(anonymousMcp.status, 401);
 });
 
 test("dashboard exposes memory and task management with user-scoped API access", async () => {
   const previous = {
     url: process.env.SUPABASE_URL,
     key: process.env.SUPABASE_SERVICE_ROLE_KEY,
-    userId: process.env.USER_ID,
-    password: process.env.DASHBOARD_PASSWORD,
+    oauthSecret: process.env.OAUTH_SESSION_SECRET,
     fetch: globalThis.fetch
   };
   const rows = new Map();
   const calls = [];
+  const createdRows = [];
   process.env.SUPABASE_URL = "https://supabase.example";
   process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-key";
-  process.env.USER_ID = "dashboard-user";
-  process.env.DASHBOARD_PASSWORD = "dashboard-password";
+  process.env.OAUTH_SESSION_SECRET = "dashboard test oauth secret with 32 characters minimum";
+  const accessToken = await issueSessionToken({ sub: "dashboard-google-user" }, process.env);
   globalThis.fetch = async (input, init = {}) => {
     const url = new URL(String(input));
     calls.push(url);
@@ -214,35 +296,37 @@ test("dashboard exposes memory and task management with user-scoped API access",
     const id = url.searchParams.get(key)?.slice(3);
     if (init.method === "POST") {
       const row = JSON.parse(init.body);
+      createdRows.push({ table, row });
       rows.set(`${table}:${row[key]}`, row);
       return Response.json([row]);
     }
     if (init.method === "PATCH") {
       const row = rows.get(`${table}:${id}`);
-      if (!row) return Response.json([]);
+      if (!row || (url.searchParams.has("user_id") && row.user_id !== url.searchParams.get("user_id").slice(3))) return Response.json([]);
       const updated = { ...row, ...JSON.parse(init.body) };
       rows.set(`${table}:${id}`, updated);
       return Response.json([updated]);
     }
     if (init.method === "DELETE") {
       const row = rows.get(`${table}:${id}`);
+      if (row && url.searchParams.has("user_id") && row.user_id !== url.searchParams.get("user_id").slice(3)) return Response.json([]);
       rows.delete(`${table}:${id}`);
       return Response.json(row ? [row] : []);
     }
     if (id) {
       const row = rows.get(`${table}:${id}`);
-      return Response.json(row ? [row] : []);
+      return Response.json(row && (!url.searchParams.has("user_id") || row.user_id === url.searchParams.get("user_id").slice(3)) ? [row] : []);
     }
     return Response.json([...rows.entries()]
-      .filter(([recordKey]) => recordKey.startsWith(`${table}:`))
+      .filter(([recordKey, row]) => recordKey.startsWith(`${table}:`) &&
+        (!url.searchParams.has("user_id") || row.user_id === url.searchParams.get("user_id").slice(3)))
       .map(([, row]) => row));
   };
 
-  const auth = "Basic " + btoa("admin:dashboard-password");
-  const call = (path, method = "GET", body) => app.request(path, {
+  const call = (path, method = "GET", body, token = accessToken) => app.request(path, {
     method,
     headers: {
-      Authorization: auth,
+      Authorization: "Bearer " + token,
       ...(body ? { "Content-Type": "application/json" } : {})
     },
     ...(body ? { body: JSON.stringify(body) } : {})
@@ -254,6 +338,33 @@ test("dashboard exposes memory and task management with user-scoped API access",
     assert.equal(dashboard.status, 200);
     assert.match(html, /Memories/);
     assert.match(html, /Tasks/);
+    assert.match(html, /Copy MCP token/);
+    assert.match(html, /\/oauth\/logout/);
+
+    const noteResponse = await call("/api/notes", "POST", {
+      title: "Private note",
+      content: "Account scoped note"
+    });
+    assert.equal(noteResponse.status, 201);
+    const note = await noteResponse.json();
+    assert.equal(createdRows.at(-1).row.user_id, "google:dashboard-google-user");
+    assert.equal((await call("/api/notes")).status, 200);
+    assert.equal(calls.at(-1).searchParams.get("user_id"), "eq.google:dashboard-google-user");
+    const otherToken = await issueSessionToken({ sub: "another-google-user" }, process.env);
+    const otherRead = await call(`/api/notes/${note.id}`, "GET", undefined, otherToken);
+    assert.equal(otherRead.status, 404);
+    assert.equal(calls.at(-1).searchParams.get("user_id"), "eq.google:another-google-user");
+
+    const skillResponse = await call("/api/skills", "POST", {
+      title: "Private skill",
+      content: "Account scoped skill"
+    });
+    assert.equal(skillResponse.status, 201);
+    assert.equal(createdRows.at(-1).row.user_id, "google:dashboard-google-user");
+    assert.equal((await call("/api/skills")).status, 200);
+    assert.equal(calls.at(-1).searchParams.get("user_id"), "eq.google:dashboard-google-user");
+    assert.equal((await call("/api/pages")).status, 200);
+    assert.equal(calls.at(-1).searchParams.get("user_id"), "eq.google:dashboard-google-user");
 
     const createdMemoryResponse = await call("/api/memories", "POST", {
       title: "Dashboard memory",
@@ -262,7 +373,7 @@ test("dashboard exposes memory and task management with user-scoped API access",
     });
     assert.equal(createdMemoryResponse.status, 201);
     const memory = await createdMemoryResponse.json();
-    assert.equal(memory.user_id, "dashboard-user");
+    assert.equal(memory.user_id, "google:dashboard-google-user");
     const listedMemories = await (await call("/api/memories")).json();
     assert.equal(listedMemories[0].id, memory.id);
     const memoryUpdateResponse = await call(`/api/memories/${memory.id}`, "PUT", { content: "Updated" });
@@ -279,7 +390,7 @@ test("dashboard exposes memory and task management with user-scoped API access",
     });
     assert.equal(createdTaskResponse.status, 201);
     const task = await createdTaskResponse.json();
-    assert.equal(task.user_id, "dashboard-user");
+    assert.equal(task.user_id, "google:dashboard-google-user");
     const updatedTaskResponse = await call(`/api/tasks/${task.task_id}`, "PUT", {
       is_completed: true
     });
@@ -289,7 +400,7 @@ test("dashboard exposes memory and task management with user-scoped API access",
     assert.equal(listedTasks[0].task_id, task.task_id);
     assert.ok(calls.some(url =>
       url.pathname.endsWith("/tasks") &&
-      url.searchParams.get("user_id") === "eq.dashboard-user" &&
+      url.searchParams.get("user_id") === "eq.google:dashboard-google-user" &&
       url.searchParams.get("is_completed") === "eq.true"
     ));
     const taskDeleteResponse = await call(`/api/tasks/${task.task_id}`, "DELETE");
@@ -299,10 +410,8 @@ test("dashboard exposes memory and task management with user-scoped API access",
     else process.env.SUPABASE_URL = previous.url;
     if (previous.key === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
     else process.env.SUPABASE_SERVICE_ROLE_KEY = previous.key;
-    if (previous.userId === undefined) delete process.env.USER_ID;
-    else process.env.USER_ID = previous.userId;
-    if (previous.password === undefined) delete process.env.DASHBOARD_PASSWORD;
-    else process.env.DASHBOARD_PASSWORD = previous.password;
+    if (previous.oauthSecret === undefined) delete process.env.OAUTH_SESSION_SECRET;
+    else process.env.OAUTH_SESSION_SECRET = previous.oauthSecret;
     globalThis.fetch = previous.fetch;
   }
 });

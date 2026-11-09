@@ -10,7 +10,7 @@ import { cleanString, cleanTags } from "./common.js";
 export const tools = [
   {
     name: "create_memory",
-    description: "Save a memory for the configured user.",
+    description: "Save a memory for the signed-in Google account.",
     inputSchema: {
       type: "object",
       properties: {
@@ -23,7 +23,7 @@ export const tools = [
   },
   {
     name: "list_memories",
-    description: "List the configured user's memories, optionally searching text or filtering by tag.",
+    description: "List the signed-in Google account's memories, optionally searching text or filtering by tag.",
     inputSchema: {
       type: "object",
       properties: {

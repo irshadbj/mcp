@@ -50,7 +50,7 @@ export async function call(tool, args, env, origin) {
     if (!isValidSlug(slug)) {
       throw new Error("Invalid slug. Use 1-64 characters: a-z, 0-9 and hyphens.");
     }
-    const existing = await getPage(env, slug);
+    const existing = await getPage(env, slug, true);
     const now = new Date().toISOString();
     const saved = await savePage(env, slug, {
       slug,
@@ -66,21 +66,21 @@ export async function call(tool, args, env, origin) {
   if (tool === "list_pages") {
     const limit = Math.max(1, Math.min(100, Number.parseInt(args.limit, 10) || 25));
     const query = typeof args.query === "string" ? args.query.trim().slice(0, 200) : "";
-    return (await listPages(env, { query, limit })).map(page => pageView(page, origin));
+    return (await listPages(env, { query, limit, ownerOnly: true })).map(page => pageView(page, origin));
   }
   if (tool === "get_page") {
     const slug = typeof args.slug === "string" ? args.slug.trim().toLowerCase() : "";
     if (!isValidSlug(slug)) throw new Error("Invalid slug.");
-    const row = await getPage(env, slug);
+    const row = await getPage(env, slug, true);
     if (!row) throw new Error("Page not found.");
     return pageView(row, origin);
   }
   if (tool === "delete_page") {
     const slug = typeof args.slug === "string" ? args.slug.trim().toLowerCase() : "";
     if (!isValidSlug(slug)) throw new Error("Invalid slug.");
-    const page = await getPage(env, slug);
+    const page = await getPage(env, slug, true);
     if (!page) throw new Error("Page not found.");
-    if (!(await deletePage(env, slug))) throw new Error("Page not found.");
+    if (!(await deletePage(env, slug, true))) throw new Error("Page not found.");
     const bookletPath = String(page.booklet || "").trim()
       ? encodeURIComponent(String(page.booklet).trim())
       : "_unfiled";

@@ -48,6 +48,7 @@ export function dbReady(env) {
 export async function listNotes(env, { query = "", tag = "", limit = 25 }, table = "notes") {
   const pairs = [
     ["select", "*"],
+    ["user_id", "eq." + ownerId(env)],
     ["order", "updated_at.desc"],
     ["limit", String(limit)]
   ];
@@ -71,7 +72,7 @@ export async function getNote(env, id, table = "notes") {
   const rows = await request(
     env,
     table,
-    qs([["select", "*"], ["id", "eq." + id], ["limit", "1"]])
+    qs([["select", "*"], ["user_id", "eq." + ownerId(env)], ["id", "eq." + id], ["limit", "1"]])
   );
   return rows && rows[0] ? rows[0] : null;
 }
@@ -80,13 +81,13 @@ export async function insertNote(env, row, table = "notes") {
   const rows = await request(env, table, "", {
     method: "POST",
     headers: { Prefer: "return=representation" },
-    body: JSON.stringify(row)
+    body: JSON.stringify({ ...row, user_id: ownerId(env) })
   });
   return rows && rows[0] ? rows[0] : null;
 }
 
 export async function updateNote(env, id, patch, table = "notes") {
-  const rows = await request(env, table, qs([["id", "eq." + id]]), {
+  const rows = await request(env, table, qs([["user_id", "eq." + ownerId(env)], ["id", "eq." + id]]), {
     method: "PATCH",
     headers: { Prefer: "return=representation" },
     body: JSON.stringify(patch)
@@ -95,19 +96,21 @@ export async function updateNote(env, id, patch, table = "notes") {
 }
 
 export async function deleteNote(env, id, table = "notes") {
-  const rows = await request(env, table, qs([["id", "eq." + id]]), {
+  const rows = await request(env, table, qs([["user_id", "eq." + ownerId(env)], ["id", "eq." + id]]), {
     method: "DELETE",
     headers: { Prefer: "return=representation" }
   });
   return Array.isArray(rows) && rows.length > 0;
 }
 
-export async function listPages(env, { query = "", limit = 25 }) {
+export async function listPages(env, { query = "", limit = 25, ownerOnly = false }) {
   const pairs = [
     ["select", "*"],
     ["order", "updated_at.desc"],
     ["limit", String(limit)]
   ];
+
+  if (ownerOnly) pairs.push(["user_id", "eq." + ownerId(env)]);
 
   if (query) {
     const pattern = '"*' + query.replace(/[\\"]/g, "\\$&") + '*"';
@@ -117,22 +120,38 @@ export async function listPages(env, { query = "", limit = 25 }) {
   return (await request(env, "pages", qs(pairs))) || [];
 }
 
-export async function getPage(env, slug) {
+export async function getPage(env, slug, ownerOnly = false) {
+  const pairs = [["select", "*"], ["slug", "eq." + slug], ["limit", "1"]];
+  if (ownerOnly) pairs.push(["user_id", "eq." + ownerId(env)]);
   const rows = await request(
     env,
     "pages",
-    qs([["select", "*"], ["slug", "eq." + slug], ["limit", "1"]])
+    qs(pairs)
   );
   return rows && rows[0] ? rows[0] : null;
 }
 
 export async function savePage(env, slug, row) {
+  const existing = await getPage(env, slug, true);
+  if (existing) {
+    const rows = await request(
+      env,
+      "pages",
+      qs([["slug", "eq." + slug], ["user_id", "eq." + ownerId(env)]]),
+      {
+        method: "PATCH",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({ ...row, user_id: ownerId(env) })
+      }
+    );
+    return rows && rows[0] ? rows[0] : null;
+  }
   try {
-    return await postPage(env, { ...row, slug });
+    return await postPage(env, { ...row, slug, user_id: ownerId(env) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!/content/i.test(message)) throw error;
-    const legacy = { ...row, slug, html: row.content };
+    const legacy = { ...row, slug, user_id: ownerId(env), html: row.content };
     delete legacy.content;
     return await postPage(env, legacy);
   }
@@ -142,18 +161,20 @@ async function postPage(env, body) {
   const rows = await request(
     env,
     "pages",
-    qs([["on_conflict", "slug"]]),
+    "",
     {
       method: "POST",
-      headers: { Prefer: "return=representation,resolution=merge-duplicates" },
+      headers: { Prefer: "return=representation" },
       body: JSON.stringify(body)
     }
   );
   return rows && rows[0] ? rows[0] : null;
 }
 
-export async function deletePage(env, slug) {
-  const rows = await request(env, "pages", qs([["slug", "eq." + slug]]), {
+export async function deletePage(env, slug, ownerOnly = false) {
+  const pairs = [["slug", "eq." + slug]];
+  if (ownerOnly) pairs.push(["user_id", "eq." + ownerId(env)]);
+  const rows = await request(env, "pages", qs(pairs), {
     method: "DELETE",
     headers: { Prefer: "return=representation" }
   });
@@ -167,7 +188,10 @@ export const updateSkill = (env, id, patch) => updateNote(env, id, patch, "skill
 export const deleteSkill = (env, id) => deleteNote(env, id, "skills");
 
 function ownerId(env) {
-  return env.USER_ID || "system_default";
+  if (typeof env.AUTH_USER_ID !== "string" || !env.AUTH_USER_ID) {
+    throw new Error("An authenticated user is required.");
+  }
+  return env.AUTH_USER_ID;
 }
 
 export async function listOwnedRecords(

@@ -1,4 +1,5 @@
 import { dashboardHtml } from "../pages/admin.js";
+import { getOAuthSession } from "../handlers/oauth.js";
 import {
   dbReady,
   deleteNote,
@@ -32,88 +33,32 @@ import {
 
 export async function handleDashboardRequest(request, env, url) {
   if (!(url.pathname === "/admin" || url.pathname === "/admin/" || url.pathname.startsWith("/api/"))) return null;
-  const denied = dashboardAuth(request, env);
-  if (denied) return denied;
+  const session = await getOAuthSession(request, env);
+  if (!session) {
+    if ((url.pathname === "/admin" || url.pathname === "/admin/") && request.method === "GET") {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: "/oauth/login?next=%2Fadmin", "Cache-Control": "no-store" }
+      });
+    }
+    return Response.json({ error: "Google sign-in required." }, {
+      status: 401,
+      headers: { "Cache-Control": "no-store", "WWW-Authenticate": 'Bearer realm="IrshadMCP"' }
+    });
+  }
+  const userEnv = { ...env, AUTH_USER_ID: session.userId };
   if ((url.pathname === "/admin" || url.pathname === "/admin/") && request.method === "GET") {
     return new Response(dashboardHtml(), {
       headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" }
     });
   }
   if (!url.pathname.startsWith("/api/")) return null;
-  if (!dbReady(env)) return Response.json({ error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" }, { status: 500 });
+  if (!dbReady(userEnv)) return Response.json({ error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY" }, { status: 500 });
   try {
-    return await handleDashboardApi(request, env, url);
+    return await handleDashboardApi(request, userEnv, url);
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : "Request failed" }, { status: 500, headers: { "Cache-Control": "no-store" } });
   }
-}
-export function dashboardAuth(request, env) {
-  // Fail closed if the dashboard password has not been configured.
-  if (!env.DASHBOARD_PASSWORD) {
-    return new Response(
-      "Dashboard is not configured. Set DASHBOARD_PASSWORD in the Vercel project environment variables.",
-      {
-        status: 503,
-        headers: {
-          "Content-Type": "text/plain; charset=utf-8",
-          "Cache-Control": "no-store"
-        }
-      }
-    );
-  }
-
-  const expectedUser = env.DASHBOARD_USER || "admin";
-  const auth = request.headers.get("Authorization") || "";
-
-  if (!auth.startsWith("Basic ")) {
-    return new Response("Authentication required", {
-      status: 401,
-      headers: {
-        "WWW-Authenticate": 'Basic realm="Notes Dashboard", charset="UTF-8"',
-        "Cache-Control": "no-store"
-      }
-    });
-  }
-
-  let decoded = "";
-  try {
-    decoded = atob(auth.slice(6));
-  } catch {}
-
-  const colon = decoded.indexOf(":");
-  const user = colon >= 0 ? decoded.slice(0, colon) : "";
-  const pass = colon >= 0 ? decoded.slice(colon + 1) : "";
-
-  if (
-    !constantTimeEqual(user, expectedUser) ||
-    !constantTimeEqual(pass, env.DASHBOARD_PASSWORD)
-  ) {
-    return new Response("Invalid username or password", {
-      status: 401,
-      headers: {
-        "WWW-Authenticate": 'Basic realm="Notes Dashboard", charset="UTF-8"',
-        "Cache-Control": "no-store"
-      }
-    });
-  }
-
-  return null;
-}
-
-function constantTimeEqual(a, b) {
-  const x = new TextEncoder().encode(String(a));
-  const y = new TextEncoder().encode(String(b));
-
-  let diff = x.length ^ y.length;
-  const n = Math.max(x.length, y.length);
-
-  for (let i = 0; i < n; i++) {
-    diff |=
-      (x[i % (x.length || 1)] || 0) ^
-      (y[i % (y.length || 1)] || 0);
-  }
-
-  return diff === 0;
 }
 
 export async function handleDashboardApi(request, env, url) {
@@ -374,7 +319,7 @@ export async function handleDashboardApi(request, env, url) {
       )
     );
 
-    const rows = await listPages(env, { query, limit });
+    const rows = await listPages(env, { query, limit, ownerOnly: true });
     return Response.json(
       rows.map(p => pageView(p, url.origin)),
       { headers }
@@ -397,7 +342,7 @@ export async function handleDashboardApi(request, env, url) {
     }
 
     if (request.method === "GET") {
-      const row = await getPage(env, slug);
+      const row = await getPage(env, slug, true);
 
       return row
         ? Response.json(pageView(row, url.origin), { headers })
@@ -405,7 +350,7 @@ export async function handleDashboardApi(request, env, url) {
     }
 
     if (request.method === "DELETE") {
-      return (await deletePage(env, slug))
+      return (await deletePage(env, slug, true))
         ? Response.json({ deleted: true, slug }, { headers })
         : Response.json({ error: "Page not found" }, { status: 404, headers });
     }
@@ -634,4 +579,3 @@ function dashboardDate(value) {
     ? value
     : false;
 }
-

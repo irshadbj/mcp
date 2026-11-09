@@ -10,7 +10,7 @@ import { cleanString } from "./common.js";
 export const tools = [
   {
     name: "create_task",
-    description: "Create a task for the configured user.",
+    description: "Create a task for the signed-in Google account.",
     inputSchema: {
       type: "object",
       properties: {
@@ -23,7 +23,7 @@ export const tools = [
   },
   {
     name: "list_tasks",
-    description: "List the configured user's tasks, optionally searching or filtering by completion.",
+    description: "List the signed-in Google account's tasks, optionally searching or filtering by completion.",
     inputSchema: {
       type: "object",
       properties: {

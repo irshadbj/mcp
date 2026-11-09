@@ -1,5 +1,6 @@
 import { Hono } from "hono";
 import { dbReady } from "./handlers/database.js";
+import { getOAuthSession, handleOAuthRequest } from "./handlers/oauth.js";
 import { corsHeaders, handleMcpMethod, rpcError } from "./handlers/protocol.js";
 import { handleDashboardRequest } from "./routes/dashboard.js";
 import { handlePublicRequest } from "./routes/public.js";
@@ -15,6 +16,9 @@ async function handle(request, env) {
     return new Response(null, { headers: corsHeaders() });
   }
 
+  const oauthResponse = await handleOAuthRequest(request, env, url);
+  if (oauthResponse) return oauthResponse;
+
   const publicResponse = await handlePublicRequest(request, env, url);
   if (publicResponse) return publicResponse;
 
@@ -28,15 +32,18 @@ async function handle(request, env) {
     );
   }
 
-  // If configured, MCP clients must provide Authorization: Bearer <key>.
-  if (env.MCP_API_KEY) {
-    const auth = request.headers.get("Authorization") || "";
-    if (auth !== `Bearer ${env.MCP_API_KEY}`) {
-      return Response.json(
-        { error: "Unauthorized" },
-        { status: 401, headers: corsHeaders() }
-      );
-    }
+  const session = await getOAuthSession(request, env);
+  if (!session) {
+    return Response.json(
+      { error: "Google sign-in required." },
+      {
+        status: 401,
+        headers: {
+          ...corsHeaders(),
+          "WWW-Authenticate": 'Bearer realm="IrshadMCP", error="invalid_token"'
+        }
+      }
+    );
   }
 
   if (request.method !== "POST") {
@@ -46,7 +53,8 @@ async function handle(request, env) {
     );
   }
 
-  if (!dbReady(env)) {
+  const userEnv = { ...env, AUTH_USER_ID: session.userId };
+  if (!dbReady(userEnv)) {
     return Response.json(
       { error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY." },
       { status: 500, headers: corsHeaders() }
@@ -60,5 +68,5 @@ async function handle(request, env) {
     return rpcError(null, -32700, "Parse error");
   }
 
-  return handleMcpMethod({ body, env, origin: url.origin });
+  return handleMcpMethod({ body, env: userEnv, origin: url.origin });
 }

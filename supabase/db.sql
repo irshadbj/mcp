@@ -3,6 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS public.notes (
   id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
   title TEXT NOT NULL,
   content TEXT NOT NULL,
   tags TEXT NOT NULL DEFAULT '[]',
@@ -13,9 +14,13 @@ CREATE TABLE IF NOT EXISTS public.notes (
 CREATE INDEX IF NOT EXISTS idx_notes_updated_at
 ON public.notes (updated_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_notes_user
+ON public.notes (user_id);
+
 -- Reusable skills (how-to guides), separate from notes.
 CREATE TABLE IF NOT EXISTS public.skills (
   id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
   title TEXT NOT NULL,
   content TEXT NOT NULL,
   tags TEXT NOT NULL DEFAULT '[]',
@@ -26,12 +31,16 @@ CREATE TABLE IF NOT EXISTS public.skills (
 CREATE INDEX IF NOT EXISTS idx_skills_updated_at
 ON public.skills (updated_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_skills_user
+ON public.skills (user_id);
+
 -- Public pages published through the MCP publish_page tool.
 -- content holds the page body. The column is deliberately NOT named "html":
 -- it may hold HTML, plain text or another data type.
 -- booklet groups pages into a booklet on the /pages shelf.
 CREATE TABLE IF NOT EXISTS public.pages (
   slug TEXT PRIMARY KEY,
+  user_id TEXT,
   title TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
   booklet TEXT NOT NULL DEFAULT '',
@@ -44,6 +53,9 @@ ON public.pages (updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_pages_booklet
 ON public.pages (booklet);
+
+CREATE INDEX IF NOT EXISTS idx_pages_user
+ON public.pages (user_id);
 
 -- Memory records used for user-specific context.
 CREATE TABLE IF NOT EXISTS public.memories (
