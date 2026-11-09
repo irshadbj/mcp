@@ -3,7 +3,7 @@ import { homeHtml } from "./pages/home.js";
 import { dashboardHtml } from "./pages/admin.js";
 import { pagesIndexHtml } from "./pages/pages.js";
 import { swScript } from "./sw.js";
-//import { MemoryService } from "./handlers/memoryHandler.js";
+import { MemoryService } from "./handlers/memoryHandler.js";
 //import { TaskService } from "./handlers/taskHandler.js";
 
 const LOGO_SVG =
