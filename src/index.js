@@ -3,8 +3,23 @@ import { homeHtml } from "./pages/home.js";
 import { dashboardHtml } from "./pages/admin.js";
 import { pagesIndexHtml } from "./pages/pages.js";
 import { swScript } from "./sw.js";
-import { MemoryService } from "./handlers/memoryHandler.js";
-//import { TaskService } from "./handlers/taskHandler.js";
+import {
+  dbReady,
+  deleteNote,
+  deletePage,
+  deleteSkill,
+  getNote,
+  getPage,
+  getSkill,
+  insertNote,
+  insertSkill,
+  listNotes,
+  listPages,
+  listSkills,
+  savePage,
+  updateNote,
+  updateSkill
+} from "../handlers/database.js";
 
 const LOGO_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">' +
@@ -703,162 +718,6 @@ async function handle(request, env) {
   }
 }
 
-/* ---------- Supabase (PostgREST) data layer ---------- */
-
-function dbReady(env) {
-  return Boolean(env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY);
-}
-
-function qs(pairs) {
-  return (
-    "?" +
-    pairs
-      .map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(v))
-      .join("&")
-  );
-}
-
-async function sb(env, table, query = "", init = {}) {
-  const endpoint =
-    String(env.SUPABASE_URL).replace(/\/+$/, "") + "/rest/v1/" + table;
-  const key = env.SUPABASE_SERVICE_ROLE_KEY;
-
-  const res = await fetch(endpoint + (query || ""), {
-    ...init,
-    headers: {
-      apikey: key,
-      Authorization: "Bearer " + key,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      ...(init.headers || {})
-    }
-  });
-
-  const text = await res.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {}
-
-  if (!res.ok) {
-    throw new Error(
-      (data && data.message) || "Database request failed (" + res.status + ")"
-    );
-  }
-  return data;
-}
-
-async function listNotes(env, { query = "", tag = "", limit = 25 }, table = "notes") {
-  const pairs = [
-    ["select", "*"],
-    ["order", "updated_at.desc"],
-    ["limit", String(limit)]
-  ];
-
-  if (query) {
-    const p = '"*' + query.replace(/[\\"]/g, "\\$&") + '*"';
-    pairs.push([
-      "or",
-      `(title.ilike.${p},content.ilike.${p},tags.ilike.${p})`
-    ]);
-  }
-
-  if (tag) {
-    pairs.push(["tags", "ilike.*" + cleanFilter(tag) + "*"]);
-  }
-
-  return (await sb(env, table, qs(pairs))) || [];
-}
-
-async function getNote(env, id, table = "notes") {
-  const rows = await sb(
-    env,
-    table,
-    qs([["select", "*"], ["id", "eq." + id], ["limit", "1"]])
-  );
-  return rows && rows[0] ? rows[0] : null;
-}
-
-async function insertNote(env, row, table = "notes") {
-  const rows = await sb(env, table, "", {
-    method: "POST",
-    headers: { Prefer: "return=representation" },
-    body: JSON.stringify(row)
-  });
-  return rows && rows[0] ? rows[0] : null;
-}
-
-async function updateNote(env, id, patch, table = "notes") {
-  const rows = await sb(env, table, qs([["id", "eq." + id]]), {
-    method: "PATCH",
-    headers: { Prefer: "return=representation" },
-    body: JSON.stringify(patch)
-  });
-  return rows && rows[0] ? rows[0] : null;
-}
-
-async function deleteNote(env, id, table = "notes") {
-  const rows = await sb(env, table, qs([["id", "eq." + id]]), {
-    method: "DELETE",
-    headers: { Prefer: "return=representation" }
-  });
-  return Array.isArray(rows) && rows.length > 0;
-}
-
-async function listPages(env, { query = "", limit = 25 }) {
-  const pairs = [
-    ["select", "*"],
-    ["order", "updated_at.desc"],
-    ["limit", String(limit)]
-  ];
-
-  if (query) {
-    const p = '"*' + query.replace(/[\\"]/g, "\\$&") + '*"';
-    pairs.push(["or", `(title.ilike.${p},slug.ilike.${p})`]);
-  }
-
-  return (await sb(env, "pages", qs(pairs))) || [];
-}
-
-async function getPage(env, slug) {
-  const rows = await sb(
-    env,
-    "pages",
-    qs([["select", "*"], ["slug", "eq." + slug], ["limit", "1"]])
-  );
-  return rows && rows[0] ? rows[0] : null;
-}
-
-async function savePage(env, slug, row) {
-  try {
-    return await postPage(env, { ...row, slug });
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : String(error);
-    if (!/content/i.test(msg)) throw error;
-    // Some databases still have the column named html instead of content.
-    const legacy = { ...row, slug, html: row.content };
-    delete legacy.content;
-    return await postPage(env, legacy);
-  }
-}
-
-async function postPage(env, body) {
-  const rows = await sb(env, "pages", qs([["on_conflict", "slug"]]), {
-    method: "POST",
-    headers: { Prefer: "return=representation,resolution=merge-duplicates" },
-    body: JSON.stringify(body)
-  });
-  return rows && rows[0] ? rows[0] : null;
-}
-
-async function deletePage(env, slug) {
-  const rows = await sb(env, "pages", qs([["slug", "eq." + slug]]), {
-    method: "DELETE",
-    headers: { Prefer: "return=representation" }
-  });
-  return Array.isArray(rows) && rows.length > 0;
-}
-
 /* ---------- helpers ---------- */
 
 function corsHeaders() {
@@ -892,11 +751,6 @@ function cleanString(value, max, trim = true) {
   return out.length > 0 && out.length <= max ? out : "";
 }
 
-function cleanFilter(value) {
-  // Strips characters that carry meaning in PostgREST filter expressions.
-  return String(value).replace(/[%_,()"]/g, "");
-}
-
 function cleanTags(value) {
   if (!Array.isArray(value)) return [];
 
@@ -919,13 +773,6 @@ function parseNote(row) {
   const tags = parseTags(row.tags);
   return { ...row, tags, html: renderNoteHtml(row.content) };
 }
-
-/* Skills reuse the note row shape but live in the skills table. */
-const listSkills = (env, opts) => listNotes(env, opts, "skills");
-const getSkill = (env, id) => getNote(env, id, "skills");
-const insertSkill = (env, row) => insertNote(env, row, "skills");
-const updateSkill = (env, id, patch) => updateNote(env, id, patch, "skills");
-const deleteSkill = (env, id) => deleteNote(env, id, "skills");
 
 /* ---------- plain text -> safe HTML rendering ---------- */
 
