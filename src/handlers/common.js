@@ -155,12 +155,14 @@ export function toSlug(value) {
 }
 
 export function pageView(row, origin) {
+  const booklet = String(row.booklet || "").trim();
+  const bookletPath = booklet ? encodeURIComponent(booklet) : "_unfiled";
   return {
     slug: row.slug,
     title: row.title,
     booklet: row.booklet || "",
     html: row.content ?? row.html ?? "",
-    url: origin + "/pages/" + row.slug,
+    url: origin + "/pages/" + bookletPath + "/" + encodeURIComponent(row.slug),
     created_at: row.created_at,
     updated_at: row.updated_at
   };

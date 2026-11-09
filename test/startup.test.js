@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { Script } from "node:vm";
 import app from "../src/index.js";
+import { dashboardHtml } from "../src/pages/admin.js";
+import { pagesIndexHtml } from "../src/pages/pages.js";
 
 test("deployment entrypoint loads and serves the public logo", async () => {
   const response = await app.request("/logo.svg");
@@ -86,11 +89,19 @@ test("MCP advertises and persists memories and tasks", async () => {
       arguments: { title: "Guide", content: "Steps" }
     });
     assert.match(calls.at(-1).url, /\/rest\/v1\/skills$/);
-    await rpc(4, "tools/call", {
+    const publishedPage = await rpc(4, "tools/call", {
       name: "publish_page",
-      arguments: { title: "Public page", html: "<h1>Hello</h1>" }
+      arguments: {
+        title: "Public page",
+        html: "<h1>Hello</h1>",
+        booklet: "Research Notes"
+      }
     });
     assert.match(calls.at(-1).url, /\/rest\/v1\/pages\?/);
+    assert.equal(
+      JSON.parse(publishedPage.result.content[0].text).url,
+      "http://localhost/pages/Research%20Notes/public-page"
+    );
 
     const memory = await rpc(2, "tools/call", {
       name: "create_memory",
@@ -178,5 +189,205 @@ test("public and dashboard routes remain separately wired", async () => {
   } finally {
     if (previous === undefined) delete process.env.DASHBOARD_PASSWORD;
     else process.env.DASHBOARD_PASSWORD = previous;
+  }
+});
+
+test("dashboard exposes memory and task management with user-scoped API access", async () => {
+  const previous = {
+    url: process.env.SUPABASE_URL,
+    key: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    userId: process.env.USER_ID,
+    password: process.env.DASHBOARD_PASSWORD,
+    fetch: globalThis.fetch
+  };
+  const rows = new Map();
+  const calls = [];
+  process.env.SUPABASE_URL = "https://supabase.example";
+  process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-key";
+  process.env.USER_ID = "dashboard-user";
+  process.env.DASHBOARD_PASSWORD = "dashboard-password";
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    calls.push(url);
+    const table = url.pathname.split("/").pop();
+    const key = table === "tasks" ? "task_id" : "id";
+    const id = url.searchParams.get(key)?.slice(3);
+    if (init.method === "POST") {
+      const row = JSON.parse(init.body);
+      rows.set(`${table}:${row[key]}`, row);
+      return Response.json([row]);
+    }
+    if (init.method === "PATCH") {
+      const row = rows.get(`${table}:${id}`);
+      if (!row) return Response.json([]);
+      const updated = { ...row, ...JSON.parse(init.body) };
+      rows.set(`${table}:${id}`, updated);
+      return Response.json([updated]);
+    }
+    if (init.method === "DELETE") {
+      const row = rows.get(`${table}:${id}`);
+      rows.delete(`${table}:${id}`);
+      return Response.json(row ? [row] : []);
+    }
+    if (id) {
+      const row = rows.get(`${table}:${id}`);
+      return Response.json(row ? [row] : []);
+    }
+    return Response.json([...rows.entries()]
+      .filter(([recordKey]) => recordKey.startsWith(`${table}:`))
+      .map(([, row]) => row));
+  };
+
+  const auth = "Basic " + btoa("admin:dashboard-password");
+  const call = (path, method = "GET", body) => app.request(path, {
+    method,
+    headers: {
+      Authorization: auth,
+      ...(body ? { "Content-Type": "application/json" } : {})
+    },
+    ...(body ? { body: JSON.stringify(body) } : {})
+  });
+
+  try {
+    const dashboard = await call("/admin");
+    const html = await dashboard.text();
+    assert.equal(dashboard.status, 200);
+    assert.match(html, /Memories/);
+    assert.match(html, /Tasks/);
+
+    const createdMemoryResponse = await call("/api/memories", "POST", {
+      title: "Dashboard memory",
+      content: "Remember from dashboard",
+      tags: ["dashboard"]
+    });
+    assert.equal(createdMemoryResponse.status, 201);
+    const memory = await createdMemoryResponse.json();
+    assert.equal(memory.user_id, "dashboard-user");
+    const listedMemories = await (await call("/api/memories")).json();
+    assert.equal(listedMemories[0].id, memory.id);
+    const memoryUpdateResponse = await call(`/api/memories/${memory.id}`, "PUT", { content: "Updated" });
+    assert.equal(memoryUpdateResponse.status, 200);
+    const updatedMemoryResponse = await call(`/api/memories/${memory.id}`);
+    assert.equal(updatedMemoryResponse.status, 200);
+    assert.equal((await updatedMemoryResponse.json()).content, "Updated");
+    const memoryDeleteResponse = await call(`/api/memories/${memory.id}`, "DELETE");
+    assert.equal(memoryDeleteResponse.status, 200);
+
+    const createdTaskResponse = await call("/api/tasks", "POST", {
+      title: "Dashboard task",
+      due_date: "2026-11-12"
+    });
+    assert.equal(createdTaskResponse.status, 201);
+    const task = await createdTaskResponse.json();
+    assert.equal(task.user_id, "dashboard-user");
+    const updatedTaskResponse = await call(`/api/tasks/${task.task_id}`, "PUT", {
+      is_completed: true
+    });
+    assert.equal(updatedTaskResponse.status, 200);
+    assert.equal((await updatedTaskResponse.json()).is_completed, true);
+    const listedTasks = await (await call("/api/tasks?completed=true")).json();
+    assert.equal(listedTasks[0].task_id, task.task_id);
+    assert.ok(calls.some(url =>
+      url.pathname.endsWith("/tasks") &&
+      url.searchParams.get("user_id") === "eq.dashboard-user" &&
+      url.searchParams.get("is_completed") === "eq.true"
+    ));
+    const taskDeleteResponse = await call(`/api/tasks/${task.task_id}`, "DELETE");
+    assert.equal(taskDeleteResponse.status, 200);
+  } finally {
+    if (previous.url === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = previous.url;
+    if (previous.key === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = previous.key;
+    if (previous.userId === undefined) delete process.env.USER_ID;
+    else process.env.USER_ID = previous.userId;
+    if (previous.password === undefined) delete process.env.DASHBOARD_PASSWORD;
+    else process.env.DASHBOARD_PASSWORD = previous.password;
+    globalThis.fetch = previous.fetch;
+  }
+});
+
+test("dashboard inline scripts compile", () => {
+  const scripts = [...dashboardHtml().matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assert.ok(scripts.length >= 2);
+  for (const [, source] of scripts) {
+    assert.doesNotThrow(() => new Script(source));
+  }
+});
+
+test("page shelf lists booklets and nested routes list and serve their pages", async () => {
+  const previous = {
+    url: process.env.SUPABASE_URL,
+    key: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    fetch: globalThis.fetch
+  };
+  const records = [
+    {
+      slug: "first-page",
+      title: "First page",
+      content: "<main>First page body</main>",
+      booklet: "Research Notes",
+      updated_at: "2026-11-09T12:00:00.000Z"
+    },
+    {
+      slug: "second-page",
+      title: "Second page",
+      content: "<main>Second page body</main>",
+      booklet: "Research Notes",
+      updated_at: "2026-11-08T12:00:00.000Z"
+    },
+    {
+      slug: "loose-page",
+      title: "Loose page",
+      content: "<main>Loose page body</main>",
+      booklet: "",
+      updated_at: "2026-11-07T12:00:00.000Z"
+    }
+  ];
+  process.env.SUPABASE_URL = "https://supabase.example";
+  process.env.SUPABASE_SERVICE_ROLE_KEY = "test-service-key";
+  globalThis.fetch = async input => {
+    const url = new URL(String(input));
+    const slug = url.searchParams.get("slug");
+    const row = slug ? records.find(page => `eq.${page.slug}` === slug) : null;
+    return Response.json(slug ? (row ? [row] : []) : records);
+  };
+
+  try {
+    const shelf = pagesIndexHtml(records);
+    assert.match(shelf, /href="\/pages\/Research%20Notes\/"/);
+    assert.match(shelf, /href="\/pages\/_unfiled\/"/);
+    assert.doesNotMatch(shelf, /href="\/pages\/Research%20Notes\/first-page"/);
+    assert.doesNotMatch(shelf, /First page<\/a>/);
+
+    const rootResponse = await app.request("/pages/");
+    const rootHtml = await rootResponse.text();
+    assert.equal(rootResponse.status, 200);
+    assert.match(rootHtml, /Research Notes/);
+    assert.doesNotMatch(rootHtml, /First page/);
+
+    const bookletResponse = await app.request("/pages/Research%20Notes/");
+    const bookletHtml = await bookletResponse.text();
+    assert.equal(bookletResponse.status, 200);
+    assert.match(bookletHtml, /First page/);
+    assert.match(bookletHtml, /href="\/pages\/Research%20Notes\/first-page"/);
+    assert.doesNotMatch(bookletHtml, /Loose page/);
+
+    const nestedPage = await app.request("/pages/Research%20Notes/first-page");
+    assert.equal(nestedPage.status, 200);
+    assert.equal(await nestedPage.text(), "<main>First page body</main>");
+
+    const unfiledPage = await app.request("/pages/_unfiled/loose-page");
+    assert.equal(unfiledPage.status, 200);
+    assert.equal(await unfiledPage.text(), "<main>Loose page body</main>");
+
+    const wrongBooklet = await app.request("/pages/Another%20Booklet/first-page");
+    assert.equal(wrongBooklet.status, 404);
+  } finally {
+    if (previous.url === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = previous.url;
+    if (previous.key === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = previous.key;
+    globalThis.fetch = previous.fetch;
   }
 });

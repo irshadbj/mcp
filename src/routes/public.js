@@ -72,10 +72,7 @@ export async function handlePublicRequest(request, env, url) {
     });
   }
 
-  if (
-    request.method === "GET" &&
-    (url.pathname === "/pages" || url.pathname === "/pages/")
-  ) {
+  if (request.method === "GET" && (url.pathname === "/pages" || url.pathname === "/pages/")) {
     const headers = {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "public, max-age=60",
@@ -95,20 +92,63 @@ export async function handlePublicRequest(request, env, url) {
     return new Response(pagesIndexHtml(rows, { error }), { headers });
   }
 
-  if (
-    request.method === "GET" &&
-    (url.pathname.startsWith("/pages/") || url.pathname.startsWith("/p/"))
-  ) {
+  if (request.method === "GET" && url.pathname.startsWith("/pages/")) {
+    const rawSegments = url.pathname.slice("/pages/".length).split("/").filter(Boolean);
+    if (rawSegments.length === 1 && url.pathname.endsWith("/")) {
+      const headers = {
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "public, max-age=60",
+        "X-Content-Type-Options": "nosniff"
+      };
+      if (!dbReady(env)) {
+        return new Response(
+          pagesIndexHtml([], { error: "Published pages are unavailable because the database is not configured." }),
+          { headers }
+        );
+      }
+
+      let booklet;
+      try {
+        booklet = decodeURIComponent(rawSegments[0]);
+      } catch {
+        return pageNotFound(headers);
+      }
+      try {
+        const allPages = await listPages(env, { query: "", limit: 100 });
+        const matches = allPages.filter(page =>
+          booklet === "_unfiled"
+            ? !String(page.booklet || "").trim()
+            : String(page.booklet || "").trim().toLocaleLowerCase() === booklet.trim().toLocaleLowerCase()
+        );
+        if (!matches.length) return pageNotFound(headers);
+        const label = booklet === "_unfiled" ? "Unfiled" : String(matches[0].booklet).trim();
+        return new Response(pagesIndexHtml(matches, { booklet: label, bookletPath: rawSegments[0] }), { headers });
+      } catch {
+        return new Response(
+          pagesIndexHtml([], { error: "Published pages could not be loaded right now. Please try again shortly." }),
+          { headers }
+        );
+      }
+    }
+
     const headers = {
       "Content-Type": "text/html; charset=utf-8",
       "X-Content-Type-Options": "nosniff",
       "Content-Security-Policy": PAGE_CSP
     };
-    let slug = "";
-    const prefix = url.pathname.startsWith("/pages/") ? "/pages/" : "/p/";
+
+    let segments = [];
     try {
-      slug = decodeURIComponent(url.pathname.slice(prefix.length)).trim().toLowerCase();
-    } catch {}
+      segments = rawSegments.map(segment => decodeURIComponent(segment));
+    } catch {
+      return pageNotFound(headers);
+    }
+    const booklet = segments.length === 2 ? segments[0] : null;
+    const slug = segments.length === 2
+      ? segments[1].trim().toLowerCase()
+      : segments.length === 1
+        ? segments[0].trim().toLowerCase()
+        : "";
     if (!isValidSlug(slug)) return pageNotFound(headers);
     if (!dbReady(env)) {
       return Response.json(
@@ -126,9 +166,17 @@ export async function handlePublicRequest(request, env, url) {
       );
     }
     if (!row) return pageNotFound(headers);
+    if (booklet !== null) {
+      const rowBooklet = String(row.booklet || "").trim();
+      const belongsToBooklet = booklet === "_unfiled"
+        ? !rowBooklet
+        : rowBooklet.toLocaleLowerCase() === booklet.trim().toLocaleLowerCase();
+      if (!belongsToBooklet) return pageNotFound(headers);
+    }
     return new Response(row.content ?? row.html ?? "", {
       headers: { ...headers, "Cache-Control": "public, max-age=60" }
     });
   }
+
   return null;
 }

@@ -78,8 +78,17 @@ export async function call(tool, args, env, origin) {
   if (tool === "delete_page") {
     const slug = typeof args.slug === "string" ? args.slug.trim().toLowerCase() : "";
     if (!isValidSlug(slug)) throw new Error("Invalid slug.");
+    const page = await getPage(env, slug);
+    if (!page) throw new Error("Page not found.");
     if (!(await deletePage(env, slug))) throw new Error("Page not found.");
-    return { deleted: true, slug, url: origin + "/pages/" + slug };
+    const bookletPath = String(page.booklet || "").trim()
+      ? encodeURIComponent(String(page.booklet).trim())
+      : "_unfiled";
+    return {
+      deleted: true,
+      slug,
+      url: origin + "/pages/" + bookletPath + "/" + encodeURIComponent(slug)
+    };
   }
   return undefined;
 }

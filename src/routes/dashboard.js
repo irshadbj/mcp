@@ -2,16 +2,21 @@ import { dashboardHtml } from "../pages/admin.js";
 import {
   dbReady,
   deleteNote,
+  deleteOwnedRecord,
   deletePage,
   deleteSkill,
+  getOwnedRecord,
   getNote,
   getPage,
   getSkill,
+  insertOwnedRecord,
   insertNote,
   insertSkill,
+  listOwnedRecords,
   listNotes,
   listPages,
   listSkills,
+  updateOwnedRecord,
   updateNote,
   updateSkill
 } from "../handlers/database.js";
@@ -179,6 +184,183 @@ export async function handleDashboardApi(request, env, url) {
       { id, title, content, tags, html: renderNoteHtml(content), created_at: now, updated_at: now },
       { status: 201, headers }
     );
+  }
+
+  if (url.pathname === "/api/memories") {
+    if (request.method === "GET") {
+      const query = (url.searchParams.get("q") || "").trim().slice(0, 200);
+      const tag = (url.searchParams.get("tag") || "").trim().slice(0, 40);
+      const limit = parseLimit(url.searchParams.get("limit"));
+      return Response.json(
+        await listOwnedRecords(env, "memories", {
+          query,
+          tag,
+          limit,
+          searchColumns: ["title", "content"]
+        }),
+        { headers }
+      );
+    }
+
+    if (request.method === "POST") {
+      const body = await safeJson(request);
+      if (!body) return Response.json({ error: "Invalid JSON body" }, { status: 400, headers });
+      const title = cleanString(body.title, 200);
+      const content = cleanString(body.content, 500000, false);
+      if (!title || !content) {
+        return Response.json({ error: "Title and content are required." }, { status: 400, headers });
+      }
+      const row = await insertOwnedRecord(env, "memories", {
+        id: crypto.randomUUID(),
+        title,
+        content,
+        tags: cleanTags(Array.isArray(body.tags) ? body.tags : String(body.tags || "").split(",")),
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      });
+      return Response.json(row, { status: 201, headers });
+    }
+  }
+
+  const memoryMatch = url.pathname.match(/^\/api\/memories\/([^/]+)$/);
+  if (memoryMatch) {
+    let id;
+    try {
+      id = decodeURIComponent(memoryMatch[1]);
+    } catch {
+      return Response.json({ error: "Invalid memory ID" }, { status: 400, headers });
+    }
+    if (request.method === "GET") {
+      const row = await getOwnedRecord(env, "memories", "id", id);
+      return row
+        ? Response.json(row, { headers })
+        : Response.json({ error: "Memory not found" }, { status: 404, headers });
+    }
+    if (request.method === "PUT") {
+      const body = await safeJson(request);
+      if (!body) return Response.json({ error: "Invalid JSON body" }, { status: 400, headers });
+      const current = await getOwnedRecord(env, "memories", "id", id);
+      if (!current) return Response.json({ error: "Memory not found" }, { status: 404, headers });
+      const title = body.title === undefined ? current.title : cleanString(body.title, 200);
+      const content = body.content === undefined ? current.content : cleanString(body.content, 500000, false);
+      const tags = body.tags === undefined
+        ? current.tags
+        : cleanTags(Array.isArray(body.tags) ? body.tags : String(body.tags || "").split(","));
+      if (!title || !content) {
+        return Response.json({ error: "Title and content cannot be empty." }, { status: 400, headers });
+      }
+      const updated = await updateOwnedRecord(env, "memories", "id", id, {
+        title, content, tags, updated_at: new Date().toISOString()
+      });
+      return updated
+        ? Response.json(updated, { headers })
+        : Response.json({ error: "Memory not found" }, { status: 404, headers });
+    }
+    if (request.method === "DELETE") {
+      return await deleteOwnedRecord(env, "memories", "id", id)
+        ? Response.json({ deleted: true, id }, { headers })
+        : Response.json({ error: "Memory not found" }, { status: 404, headers });
+    }
+  }
+
+  if (url.pathname === "/api/tasks") {
+    if (request.method === "GET") {
+      const query = (url.searchParams.get("q") || "").trim().slice(0, 200);
+      const completedParam = url.searchParams.get("completed");
+      const completed = completedParam === "true"
+        ? true
+        : completedParam === "false"
+          ? false
+          : undefined;
+      return Response.json(
+        await listOwnedRecords(env, "tasks", {
+          query,
+          completed,
+          limit: parseLimit(url.searchParams.get("limit")),
+          searchColumns: ["title", "description"]
+        }),
+        { headers }
+      );
+    }
+
+    if (request.method === "POST") {
+      const body = await safeJson(request);
+      if (!body) return Response.json({ error: "Invalid JSON body" }, { status: 400, headers });
+      const title = cleanString(body.title, 200);
+      const description = body.description === undefined || body.description === null
+        ? null
+        : cleanString(body.description, 50000, false);
+      const dueDate = dashboardDate(body.due_date);
+      if (!title || (body.description != null && description === "")) {
+        return Response.json({ error: "A title is required and description cannot be empty." }, { status: 400, headers });
+      }
+      if (dueDate === false) return Response.json({ error: "due_date must be a valid YYYY-MM-DD date." }, { status: 400, headers });
+      const now = new Date().toISOString();
+      const row = await insertOwnedRecord(env, "tasks", {
+        task_id: crypto.randomUUID(),
+        title,
+        description,
+        due_date: dueDate,
+        is_completed: Boolean(body.is_completed),
+        created_at: now,
+        updated_at: now
+      });
+      return Response.json(row, { status: 201, headers });
+    }
+  }
+
+  const taskMatch = url.pathname.match(/^\/api\/tasks\/([^/]+)$/);
+  if (taskMatch) {
+    let id;
+    try {
+      id = decodeURIComponent(taskMatch[1]);
+    } catch {
+      return Response.json({ error: "Invalid task ID" }, { status: 400, headers });
+    }
+    if (request.method === "GET") {
+      const row = await getOwnedRecord(env, "tasks", "task_id", id);
+      return row
+        ? Response.json(row, { headers })
+        : Response.json({ error: "Task not found" }, { status: 404, headers });
+    }
+    if (request.method === "PUT") {
+      const body = await safeJson(request);
+      if (!body) return Response.json({ error: "Invalid JSON body" }, { status: 400, headers });
+      const current = await getOwnedRecord(env, "tasks", "task_id", id);
+      if (!current) return Response.json({ error: "Task not found" }, { status: 404, headers });
+      const patch = {};
+      if (body.title !== undefined) {
+        patch.title = cleanString(body.title, 200);
+        if (!patch.title) return Response.json({ error: "Title cannot be empty." }, { status: 400, headers });
+      }
+      if (body.description !== undefined) {
+        patch.description = body.description === null ? null : cleanString(body.description, 50000, false);
+        if (patch.description === "") return Response.json({ error: "Description cannot be empty." }, { status: 400, headers });
+      }
+      if (body.due_date !== undefined) {
+        patch.due_date = dashboardDate(body.due_date);
+        if (patch.due_date === false) return Response.json({ error: "due_date must be a valid YYYY-MM-DD date." }, { status: 400, headers });
+      }
+      if (body.is_completed !== undefined) {
+        if (typeof body.is_completed !== "boolean") {
+          return Response.json({ error: "is_completed must be a boolean." }, { status: 400, headers });
+        }
+        patch.is_completed = body.is_completed;
+      }
+      if (!Object.keys(patch).length) {
+        return Response.json({ error: "At least one task field must be provided." }, { status: 400, headers });
+      }
+      patch.updated_at = new Date().toISOString();
+      const updated = await updateOwnedRecord(env, "tasks", "task_id", id, patch);
+      return updated
+        ? Response.json(updated, { headers })
+        : Response.json({ error: "Task not found" }, { status: 404, headers });
+    }
+    if (request.method === "DELETE") {
+      return await deleteOwnedRecord(env, "tasks", "task_id", id)
+        ? Response.json({ deleted: true, id }, { headers })
+        : Response.json({ error: "Task not found" }, { status: 404, headers });
+    }
   }
 
   if (request.method === "GET" && url.pathname === "/api/pages") {
@@ -440,6 +622,16 @@ async function safeJson(request) {
   }
 }
 
+function parseLimit(value) {
+  return Math.max(1, Math.min(100, Number.parseInt(value || "100", 10) || 100));
+}
 
-
+function dashboardDate(value) {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(value + "T00:00:00.000Z");
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
+    ? value
+    : false;
+}
 
