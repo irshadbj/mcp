@@ -3,6 +3,8 @@ import { homeHtml } from "./pages/home.js";
 import { dashboardHtml } from "./pages/admin.js";
 import { pagesIndexHtml } from "./pages/pages.js";
 import { swScript } from "./sw.js";
+import { MemoryService } from "./handlers/memoryHandler.js";
+import { TaskService } from "./handlers/taskHandler.js";
 
 const LOGO_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">' +
@@ -18,7 +20,7 @@ const LOGO_SVG =
   '</svg>';
 
 const SERVER_DESCRIPTION =
-  "Irshad's private notes server. Private notes are stored in the Supabase notes table, reusable skills in the skills table, and public HTML pages separately in the pages table. For a public HTML page, use publish_page and never create_note; pages can be grouped into a booklet on the /pages shelf and are served at /pages/<slug>.";
+  "Irshad's private notes server. Private notes are stored in the Supabase notes table, reusable skills in the skills table, and public HTML pages separately in the pages table. For a public HTML page, use publish_page and never create_note; pages can be grouped into a booklet on the /pages shelf and are served at /pages/<slug>. Memories and Tasks features have been added as new tool endpoints.";
 
 // Published pages are untrusted markup served from this origin, so scripts,
 // same-origin requests and framing are all denied.
@@ -258,12 +260,12 @@ async function handle(request, env) {
       tools: [
         {
           name: "create_note",
-          description: "Create a private note in the notes table. For a public HTML page, use publish_page instead; do not save published pages as notes.",
+          description: "Create a private note in the notes table. For public pages, use publish_page instead. Memories are stored via create_memory.",
           inputSchema: {
             type: "object",
             properties: {
               title: { type: "string", minLength: 1, maxLength: 200 },
-              content: { type: "string", minLength: 1, maxLength: 50000 },
+              content: { type: "string", minLength: 1, maxLength: 500000 },
               tags: { type: "array", items: { type: "string" }, maxItems: 20 }
             },
             required: ["title", "content"]
@@ -438,7 +440,7 @@ async function handle(request, env) {
 
     if (tool === "create_note") {
       const title = cleanString(args.title, 200);
-      const content = cleanString(args.content, 50000, false);
+      const content = cleanString(args.content, 500000, false);
 
       if (!title || !content) {
         throw new Error("title and content are required.");
